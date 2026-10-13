@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.5", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.6", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -232,6 +232,9 @@ internal static class ContactsPatches
         internal int Position;
         internal bool Creating;
         internal string? Selection;
+        internal Slot? Spacer;
+        // -1は未集計、0は終了。検索解除後も再開しない。
+        internal int ReservedRows = -1;
         private long extraRows;
         internal long RowOrder(string id) => (Order.TryGetValue(id, out int index) ? index : Contacts!.Count + extraRows++) * 100L;
 
@@ -241,6 +244,40 @@ internal static class ContactsPatches
             Position += Math.Min(remaining, Contacts!.Count - Position);
             return (start, Position);
         }
+
+        internal void ClearSpacer()
+        {
+            ReservedRows = 0;
+            var slot = Spacer;
+            Spacer = null;
+            if (slot != null && !slot.IsRemoved) slot.Destroy();
+        }
+    }
+
+    private static void UpdateSpacer(ContactsDialog dialog, Loading state)
+    {
+        if (state.ReservedRows == 0) return;
+        if (state.ReservedRows < 0) state.ReservedRows = state.Contacts!.Count(data => !data.Contact.ShouldBeHidden);
+        int remaining = state.ReservedRows - Items(dialog).Count;
+        var root = ListUI(dialog).Root;
+        var layout = root.GetComponent<VerticalLayout>();
+        if (remaining <= 0 || layout == null)
+        {
+            state.ClearSpacer();
+            return;
+        }
+        if (state.Spacer == null)
+        {
+            state.Spacer = root.AddSlot("SmoothContacts Spacer");
+            state.Spacer.OrderOffset = long.MaxValue;
+            state.Spacer.AttachComponent<RectTransform>();
+            state.Spacer.AttachComponent<LayoutElement>();
+        }
+        // ponytail: 標準行高32と初期件数で予約する。可変行高・途中の件数変化には実測と再集計が必要。
+        float spacing = layout.Spacing.Value;
+        float height = remaining * (32f + spacing) - spacing;
+        var element = state.Spacer.GetComponent<LayoutElement>();
+        element.MinHeight.Value = element.PreferredHeight.Value = height;
     }
 
     // Activeの判定は本体に任せ、検索解除の再表示と生成で件数制限を共有する。
@@ -285,7 +322,8 @@ internal static class ContactsPatches
             }
             var (start, end) = state.TakeBatch(remaining);
             for (int i = start; i < end; i++) Generate(dialog, state, state.Contacts[i], term);
-            if (state.Position == state.Contacts.Count && state.Deferred.Count == 0) Pending.Remove(dialog);
+            if (state.Position == state.Contacts.Count && state.Deferred.Count == 0) EndLoading(dialog);
+            else UpdateSpacer(dialog, state);
         }
         catch (Exception error)
         {
@@ -326,6 +364,8 @@ internal static class ContactsPatches
                 // ponytail: 索引にない選択だけO(N)。通常の選択には索引を使う。
                 else state.Manager.ForeachContactData(candidate => { if (candidate.UserId == __0) data = candidate; });
                 if (data != null) Generate(__instance, state, data, NormalizeQuery(Search(__instance).Target.TargetString));
+                if (Items(__instance).ContainsKey(__0)) UpdateSpacer(__instance, state);
+                else state.ClearSpacer();
             }
         }
         catch (Exception error)
@@ -366,7 +406,11 @@ internal static class ContactsPatches
         }
     }
 
-    internal static void BeforeSearch(ContactsDialog __instance) => Restoring.Remove(__instance);
+    internal static void BeforeSearch(ContactsDialog __instance)
+    {
+        Restoring.Remove(__instance);
+        if (Pending.TryGetValue(__instance, out var state)) state.ClearSpacer();
+    }
 
     internal static void QueueRestore(Slot slot, ContactsDialog dialog)
     {
@@ -397,14 +441,20 @@ internal static class ContactsPatches
 
     private static void Abort(ContactsDialog dialog, Exception error)
     {
-        Pending.Remove(dialog);
+        EndLoading(dialog);
         SortRequested(dialog) = true;
         ReportError?.Invoke(error);
     }
 
+    private static void EndLoading(ContactsDialog dialog)
+    {
+        if (Pending.TryGetValue(dialog, out var state)) state.ClearSpacer();
+        Pending.Remove(dialog);
+    }
+
     internal static void OnDispose(ContactsDialog __instance)
     {
-        Pending.Remove(__instance);
+        EndLoading(__instance);
         Restoring.Remove(__instance);
     }
 }

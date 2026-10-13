@@ -20,6 +20,9 @@ internal static class Program
     private static readonly List<Slot> changed = [];
     private static readonly Dictionary<SyncRef<Text>, Text> texts = [];
     private static readonly List<string> selections = [];
+    private static readonly Dictionary<Slot, List<Component>> spacerComponents = [];
+    private static readonly HashSet<Slot> destroyed = [];
+    private static VerticalLayout? layout;
     private static string query = "";
     private static bool visible = true;
     private static int activeWrites;
@@ -53,7 +56,7 @@ internal static class Program
         AccessTools.Field(typeof(ContactManager), "contacts").SetValue(manager, current);
         ContactData Data(string id, OnlineStatus status = OnlineStatus.Offline)
         {
-            var data = new ContactData(manager, new Contact { ContactUserId = id, ContactUsername = id });
+            var data = new ContactData(manager, new Contact { ContactUserId = id, ContactUsername = id, ContactStatus = ContactStatus.Accepted });
             data.CurrentStatus.OnlineStatus = status;
             current[id] = data;
             return data;
@@ -119,7 +122,12 @@ internal static class Program
             Patch(AccessTools.PropertyGetter(typeof(Slot), "IsActive"), nameof(IsActive));
             Patch(AccessTools.PropertyGetter(typeof(Slot), "ActiveSelf"), nameof(GetActive));
             Patch(AccessTools.PropertyGetter(typeof(Slot), "OrderOffset"), nameof(GetOrder));
+            Patch(AccessTools.PropertySetter(typeof(Slot), "OrderOffset"), nameof(SetOrder));
             Patch(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf"), nameof(SetActive));
+            Patch(AccessTools.Method(typeof(Slot), "AddSlot", [typeof(string), typeof(bool)]), nameof(AddSlot));
+            Patch(AccessTools.Method(typeof(Slot), "Destroy", Type.EmptyTypes), nameof(DestroySlot));
+            Patch(AccessTools.DeclaredMethod(typeof(ContainerWorker<Component>), "AttachComponentInternal"), nameof(Attach));
+            Patch(AccessTools.PropertySetter(typeof(SyncField<float>), "Value"), nameof(SetFloat));
             Patch(AccessTools.PropertyGetter(typeof(SyncRef<Text>), "Target"), nameof(GetText));
             Patch(AccessTools.PropertyGetter(typeof(TextField), "TargetString"), nameof(GetQuery));
             Patch(AccessTools.PropertyGetter(typeof(TextEditor), "TargetString"), nameof(GetQuery));
@@ -137,6 +145,7 @@ internal static class Program
                 transpiler: new HarmonyMethod(typeof(ContactsPatches), nameof(ContactsPatches.TranspileSearch)));
             CheckLoading(manager, current, Data);
             CheckRestoring(manager, Data);
+            CheckSpacer(manager, current, Data);
         }
         finally { boundary.UnpatchSelf(); ContactsPatches.ReportError = null; }
 
@@ -216,6 +225,7 @@ internal static class Program
         AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(dialog, [root]);
         AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
         ContactsPatches.Items(dialog) = [];
+        SetListUI(dialog);
         ContactsPatches.ReportError = error => throw new InvalidOperationException("生成検査中の例外", error);
         var created = new List<string>();
         void Update(ContactData entry)
@@ -242,6 +252,7 @@ internal static class Program
         for (int i = 0; i < 3; i++) Check(!Tick(dialog) && created.Count == 10 && state.Position == 10, "親が非アクティブなら本体の判定で生成停止");
         Check(!ContactsPatches.BeforeSelect(dialog, "row30"), "非アクティブ中の選択を保留");
         visible = true;
+        ContactsPatches.BeforeSearch(dialog);
         query = "row2";
         foreach (var item in ContactsPatches.Items(dialog).Values) active[item.Slot] = ContactsPatches.MatchesSearch(item.Username, item.AlternateNames, query);
         ContactsPatches.UpdateLoading(dialog);
@@ -304,6 +315,7 @@ internal static class Program
         AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
         AccessTools.Field(typeof(ContactsDialog), "_searchResultItems").SetValue(dialog, new List<ContactItem>());
         ContactsPatches.Items(dialog) = [];
+        SetListUI(dialog);
         var errors = new List<Exception>();
         ContactsPatches.ReportError = errors.Add;
         var searchChanged = AccessTools.MethodDelegate<Action<ContactsDialog, TextEditor>>(AccessTools.DeclaredMethod(typeof(ContactsDialog), "SearchTextChanged"));
@@ -411,6 +423,100 @@ internal static class Program
         Check(!ContactsPatches.Pending.TryGetValue(dialog, out _) && Waiting() == 0, "Disposeで生成と検索の両方を解放");
     }
 
+    private static void CheckSpacer(ContactManager manager, Dictionary<string, ContactData> current, Func<string, OnlineStatus, ContactData> data)
+    {
+        var dialog = Empty<ContactsDialog>();
+        AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(dialog, [root]);
+        AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
+        AccessTools.Field(typeof(ContactsDialog), "_searchResultItems").SetValue(dialog, new List<ContactItem>());
+        var errors = new List<Exception>();
+        ContactsPatches.ReportError = errors.Add;
+        bool fail = false;
+        ContactsPatches.Loading Begin(int count)
+        {
+            SetListUI(dialog);
+            ContactsPatches.Items(dialog) = [];
+            query = ""; visible = true; fail = false;
+            var state = new ContactsPatches.Loading(manager, entry =>
+            {
+                if (fail) throw new InvalidOperationException("生成中断の検査");
+                if (!entry.Contact.ShouldBeHidden) ContactsPatches.Items(dialog)[entry.UserId] = Item(entry);
+            });
+            (state.Contacts, state.Order) = ContactsPatches.Prepare(
+                Enumerable.Range(0, count).Select(i => data($"height{i:D3}", OnlineStatus.Offline)).ToList(), _ => 0);
+            ContactsPatches.Pending.Add(dialog, state);
+            return state;
+        }
+        float Height(Slot slot)
+        {
+            var element = spacerComponents[slot].OfType<LayoutElement>().Single();
+            Check(element.MinHeight.Value == element.PreferredHeight.Value, "空白の最小・希望高さが一致");
+            return element.PreferredHeight.Value;
+        }
+        var state = Begin(100);
+        var hidden = data("hidden", OnlineStatus.Offline);
+        hidden.Contact.ContactStatus = ContactStatus.Ignored;
+        Check(hidden.Contact.ShouldBeHidden, "非表示Contactを検査に含める");
+        state.Contacts!.Add(hidden);
+        int before = spacerComponents.Count;
+        Tick(dialog);
+        var spacer = state.Spacer!;
+        Check(state.ReservedRows == 100 && Height(spacer) == 3236,
+            $"非表示対象を除き、10行生成後は残り90行分を予約: 予約={state.ReservedRows}, 生成={ContactsPatches.Items(dialog).Count}, エラー={string.Join(';', errors)}");
+        Check(orders[spacer] == long.MaxValue && spacerComponents[spacer].Select(c => c.GetType())
+            .SequenceEqual(new[] { typeof(RectTransform), typeof(LayoutElement) }), "末尾の単一Slotは描画・操作要素を持たない");
+        visible = false; Tick(dialog);
+        Check(state.Position == 10 && Height(spacer) == 3236, "非アクティブ中は生成も空白も進まない");
+        visible = true;
+        Check(ContactsPatches.BeforeSelect(dialog, "height090") && Height(spacer) == 3200, "先行選択の1行分も予約から引く");
+        while (ContactsPatches.Pending.TryGetValue(dialog, out _))
+        {
+            Tick(dialog);
+            int count = ContactsPatches.Items(dialog).Count;
+            float total = state.Spacer == null ? count * 32 + (count - 1) * 4 : count * 36 + Height(spacer);
+            Check(total == 3596, "全更新で完成時と同じ高さを保つ（外側余白を除く）");
+        }
+        Check(state.Spacer == null && destroyed.Contains(spacer) && spacerComponents.Count == before + 1,
+            "空白は一つを使い回し、完了時に除去");
+
+        state = Begin(10); before = spacerComponents.Count; Tick(dialog);
+        Check(state.Spacer == null && spacerComponents.Count == before, "1更新で終われば空白を作らない");
+        state = Begin(11); layout!.Spacing.Value = 6; Tick(dialog);
+        Check(Height(state.Spacer!) == 32, "残り1行では末尾の余分な間隔を予約しない");
+        ContactsPatches.OnDispose(dialog);
+        state = Begin(23); layout!.Spacing.Value = 6; Tick(dialog);
+        Check(Height(state.Spacer!) + 10 * 38 == 23 * 32 + 22 * 6, "一覧の現在の間隔で高さを合わせる");
+        ContactsPatches.OnDispose(dialog);
+        state = Begin(30); Tick(dialog); spacer = state.Spacer!;
+        var searchChanged = AccessTools.MethodDelegate<Action<ContactsDialog, TextEditor>>(AccessTools.DeclaredMethod(typeof(ContactsDialog), "SearchTextChanged"));
+        query = "height000"; searchChanged(dialog, Empty<TextEditor>());
+        Check(state.Spacer == null && destroyed.Contains(spacer) && ContactsPatches.Items(dialog).Values.Count(i => active[i.Slot]) == 1,
+            "検索は空白を除き、完全一致行を即時表示");
+        query = ""; searchChanged(dialog, Empty<TextEditor>()); Tick(dialog);
+        Check(state.Spacer == null && state.ReservedRows == 0, "検索解除後も空白を作り直さない");
+        ContactsPatches.OnDispose(dialog);
+
+        foreach (string reason in new[] { "dispose", "failure", "nonfriend", "hidden", "removed" })
+        {
+            state = Begin(21); Tick(dialog); spacer = state.Spacer!;
+            if (reason == "dispose") ContactsPatches.OnDispose(dialog);
+            if (reason == "failure") { fail = true; Tick(dialog); }
+            if (reason == "nonfriend") ContactsPatches.BeforeSelect(dialog, "unknown-nonfriend");
+            if (reason == "hidden") ContactsPatches.BeforeSelect(dialog, hidden.UserId);
+            if (reason == "removed")
+            {
+                foreach (var entry in state.Contacts!.Skip(10)) current.Remove(entry.UserId);
+                Tick(dialog); Tick(dialog);
+            }
+            Check(state.Spacer == null && destroyed.Contains(spacer), $"空白が残らない: {reason}");
+            ContactsPatches.OnDispose(dialog);
+        }
+        Check(errors.Count == 1, "意図した生成失敗だけを記録");
+        state = Begin(21); layout = null; before = spacerComponents.Count; Tick(dialog);
+        Check(state.ReservedRows == 0 && spacerComponents.Count == before && state.Position == 10, "VerticalLayoutがなければ高さ確保だけを省く");
+        ContactsPatches.OnDispose(dialog);
+    }
+
     private static ContactItem Item(ContactData data, bool unread = false)
     {
         var slot = Empty<Slot>();
@@ -442,7 +548,45 @@ internal static class Program
     private static bool GetSearch(ref TextField __result) { __result = search; return false; }
     private static bool GetText(SyncRef<Text> __instance, ref Text __result) { __result = texts[__instance]; return false; }
     private static bool GetQuery(ref string __result) { queryReads++; __result = query; return false; }
-    private static bool GetItem(Slot __instance, ref ContactItem __result) { __result = rows[__instance]; return false; }
+    private static bool GetItem(Slot __instance, ref object? __result)
+    {
+        __result = __instance == root ? layout : spacerComponents.TryGetValue(__instance, out var components)
+            ? components.OfType<LayoutElement>().Single() : rows[__instance];
+        return false;
+    }
+    private static void SetListUI(ContactsDialog dialog)
+    {
+        var ui = Empty<UIBuilder>();
+        AccessTools.Field(typeof(UIBuilder), "roots").SetValue(ui, new Stack<Slot>([root]));
+        AccessTools.Field(typeof(ContactsDialog), "listUi").SetValue(dialog, ui);
+        layout = Empty<VerticalLayout>();
+        var spacing = new Sync<float>();
+        AccessTools.Field(typeof(SyncField<float>), "_value").SetValue(spacing, 4f);
+        AccessTools.Field(typeof(DirectionalLayout), "Spacing").SetValue(layout, spacing);
+    }
+    private static bool SetOrder(Slot __instance, long __0) { orders[__instance] = __0; return false; }
+    private static bool AddSlot(string __0, ref Slot __result)
+    {
+        Check(__0 == "SmoothContacts Spacer", "高さ確保以外のSlotを追加しない");
+        __result = Empty<Slot>(); spacerComponents[__result] = []; return false;
+    }
+    private static bool Attach(Slot __instance, Component __0)
+    {
+        AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(__0, [__instance]);
+        foreach (var field in __0.GetType().GetFields().Where(f => f.FieldType == typeof(Sync<float>)))
+            field.SetValue(__0, new Sync<float>());
+        spacerComponents[__instance].Add(__0);
+        return false;
+    }
+    private static bool DestroySlot(Slot __instance)
+    {
+        Check(spacerComponents.ContainsKey(__instance) && destroyed.Add(__instance), "所有する空白Slotだけを一度除去");
+        return false;
+    }
+    private static bool SetFloat(SyncField<float> __instance, float __0)
+    {
+        AccessTools.Field(typeof(SyncField<float>), "_value").SetValue(__instance, __0); return false;
+    }
     private static bool OpenPage(ContactsDialog __instance, string __0) { selections.Add(__0); Check(ContactsPatches.BeforeSelect(__instance, __0), "再開時の選択は本体へ通す"); return false; }
     private static T Empty<T>() where T : class => (T)RuntimeHelpers.GetUninitializedObject(typeof(T));
     private static bool Tick(ContactsDialog dialog) => canRun(dialog) && ContactsPatches.UpdateLoading(dialog);

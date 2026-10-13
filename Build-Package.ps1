@@ -21,7 +21,7 @@ $manifest = [ordered]@{
     name = 'ContactsLoading'
     author = 'markn2000'
     version_number = $version
-    description = 'Contactsの生成を複数の更新に分散し、未読あり・オンラインの優先分と残りを2段階で表示します。1更新あたりの生成件数を設定できます。'
+    description = 'Speeds up Contacts loading and reduces freezing when opening the tab.'
     website_url = 'https://github.com/MarkN2000/ContactsLoading'
     dependencies = $dependencies
 } | ConvertTo-Json

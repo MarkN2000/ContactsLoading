@@ -144,6 +144,7 @@ internal static class Program
                 prefix: new HarmonyMethod(typeof(ContactsPatches), nameof(ContactsPatches.BeforeSearch)),
                 transpiler: new HarmonyMethod(typeof(ContactsPatches), nameof(ContactsPatches.TranspileSearch)));
             CheckLoading(manager, current, Data);
+            CheckSelection(manager, Data);
             CheckRestoring(manager, Data);
             CheckSpacer(manager, current, Data);
         }
@@ -304,6 +305,46 @@ internal static class Program
         ContactsPatches.Pending.Add(dialog, failed);
         ContactsPatches.UpdateLoading(dialog);
         Check(ReferenceEquals(reported, failure) && !failed.Creating && !ContactsPatches.Pending.TryGetValue(dialog, out _) && ContactsPatches.SortRequested(dialog), "例外で記録・状態解放・本体ソートへ復帰");
+    }
+
+    private static void CheckSelection(ContactManager manager, Func<string, OnlineStatus, ContactData> data)
+    {
+        var dialog = Empty<ContactsDialog>();
+        AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(dialog, [root]);
+        AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
+        SetListUI(dialog);
+        var existing = data("select-existing", OnlineStatus.Online);
+        var cloud = Item(data("select-cloud", OnlineStatus.Offline));
+        cloud.Contact.ContactStatus = ContactStatus.SearchResult;
+        ContactsPatches.Items(dialog) = new() { [existing.UserId] = Item(existing) };
+        ((List<ContactItem>)AccessTools.Field(typeof(ContactsDialog), "_searchResultItems").GetValue(dialog)!).Add(cloud);
+        var state = new ContactsPatches.Loading(manager, _ => throw new InvalidOperationException("既存行の選択で生成した"));
+        ContactsPatches.Pending.Add(dialog, state);
+        foreach (bool prepared in new[] { false, true })
+        foreach (bool shown in new[] { false, true })
+        {
+            state.Contacts = prepared ? [] : null;
+            visible = shown;
+            foreach (string id in new[] { existing.UserId, cloud.Contact.ContactUserId })
+            {
+                state.Selection = "older-selection";
+                Check(ContactsPatches.BeforeSelect(dialog, id) && state.Selection == null && state.Position == 0,
+                    "生成済みのフレンド・検索結果は即時通過し、古い選択待ちを残さない");
+            }
+        }
+        state.Contacts = null; visible = true;
+        Check(!ContactsPatches.BeforeSelect(dialog, "not-ready"), "未生成の相手は準備完了まで待つ");
+        var item = ContactsPatches.Items(dialog)[existing.UserId];
+        active[item.Slot] = false;
+        ContactsPatches.QueueRestore(item.Slot, dialog);
+        Check(!ContactsPatches.UpdateLoading(dialog) && active[item.Slot] && state.Contacts == null,
+            "準備待ちでも検索復帰を進め、行生成は始めない");
+        ContactsPatches.BeforeSelect(dialog, existing.UserId);
+        int opened = selections.Count;
+        state.Contacts = [];
+        Tick(dialog);
+        Check(selections.Count == opened && !ContactsPatches.Pending.TryGetValue(dialog, out _),
+            "準備完了後に古い選択を再実行しない");
     }
 
     private static void CheckRestoring(ContactManager manager, Func<string, OnlineStatus, ContactData> data)
@@ -556,6 +597,7 @@ internal static class Program
     }
     private static void SetListUI(ContactsDialog dialog)
     {
+        AccessTools.Field(typeof(ContactsDialog), "_searchResultItems").SetValue(dialog, new List<ContactItem>());
         var ui = Empty<UIBuilder>();
         AccessTools.Field(typeof(UIBuilder), "roots").SetValue(ui, new Stack<Slot>([root]));
         AccessTools.Field(typeof(ContactsDialog), "listUi").SetValue(dialog, ui);

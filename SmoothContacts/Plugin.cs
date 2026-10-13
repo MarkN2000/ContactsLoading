@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.6", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.7", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -56,6 +56,8 @@ internal static class ContactsPatches
     internal static readonly ConditionalWeakTable<ContactsDialog, PriorityQueue<ContactItem, long>> Restoring = new();
     internal static readonly AccessTools.FieldRef<ContactsDialog, Dictionary<string, ContactItem>> Items =
         AccessTools.FieldRefAccess<ContactsDialog, Dictionary<string, ContactItem>>("_contactItems");
+    private static readonly AccessTools.FieldRef<ContactsDialog, List<ContactItem>> SearchResults =
+        AccessTools.FieldRefAccess<ContactsDialog, List<ContactItem>>("_searchResultItems");
     internal static readonly AccessTools.FieldRef<ContactsDialog, bool> SortRequested =
         AccessTools.FieldRefAccess<ContactsDialog, bool>("sortList");
     private static readonly AccessTools.FieldRef<ContactsDialog, SyncRef<TextField>> Search =
@@ -286,7 +288,6 @@ internal static class ContactsPatches
         bool loading = Pending.TryGetValue(dialog, out var state);
         bool restoring = Restoring.TryGetValue(dialog, out var changes);
         if (!loading && !restoring) return SortRequested(dialog);
-        if (!restoring && state?.Contacts == null) return false;
         int remaining = Math.Max(1, BatchSize.Value);
         if (restoring)
         {
@@ -350,6 +351,8 @@ internal static class ContactsPatches
     internal static bool BeforeSelect(ContactsDialog __instance, string __0)
     {
         if (string.IsNullOrEmpty(__0) || !Pending.TryGetValue(__instance, out var state)) return true;
+        state.Selection = null;
+        if (Items(__instance).ContainsKey(__0) || SearchResults(__instance).Any(item => item.Contact.ContactUserId == __0)) return true;
         if (state.Contacts == null || !__instance.Slot.IsActive)
         {
             state.Selection = __0;
@@ -357,16 +360,13 @@ internal static class ContactsPatches
         }
         try
         {
-            if (!Items(__instance).ContainsKey(__0))
-            {
-                ContactData? data = null;
-                if (state.Order.TryGetValue(__0, out int index)) data = state.Contacts[index];
-                // ponytail: 索引にない選択だけO(N)。通常の選択には索引を使う。
-                else state.Manager.ForeachContactData(candidate => { if (candidate.UserId == __0) data = candidate; });
-                if (data != null) Generate(__instance, state, data, NormalizeQuery(Search(__instance).Target.TargetString));
-                if (Items(__instance).ContainsKey(__0)) UpdateSpacer(__instance, state);
-                else state.ClearSpacer();
-            }
+            ContactData? data = null;
+            if (state.Order.TryGetValue(__0, out int index)) data = state.Contacts[index];
+            // ponytail: 索引にない選択だけO(N)。通常の選択には索引を使う。
+            else state.Manager.ForeachContactData(candidate => { if (candidate.UserId == __0) data = candidate; });
+            if (data != null) Generate(__instance, state, data, NormalizeQuery(Search(__instance).Target.TargetString));
+            if (Items(__instance).ContainsKey(__0)) UpdateSpacer(__instance, state);
+            else state.ClearSpacer();
         }
         catch (Exception error)
         {

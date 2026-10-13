@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.10", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.11", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -52,25 +52,10 @@ internal static class ContactsPatches
     internal static ConfigEntry<int> PauseUpdates = null!;
     internal static void BindSettings(ConfigFile config)
     {
-        // 標準の読込で旧キーを移行する。新キーの値と本来の既定値はそれぞれ保持する。
-        var saved = new Dictionary<string, string?>();
-        bool migrated = false;
-        foreach (var (name, oldName) in new[] { ("Batch size", "1更新あたりの件数"), ("Updates to skip", "処理間に休む更新回数") })
-        {
-            var old = config.Bind<string?>("生成", oldName, null);
-            var current = config.Bind<string?>("Loading", name, null);
-            saved[name] = current.Value ?? old.Value;
-            migrated |= old.Value != null;
-            config.Remove(old.Definition);
-            config.Remove(current.Definition);
-        }
         BatchSize = config.Bind("Loading", "Batch size", 5,
             "Maximum contacts to create or restore per batch. Values below 1 are treated as 1. Applies to the next batch.");
         PauseUpdates = config.Bind("Loading", "Updates to skip", 1,
             "Updates to skip between batches. 0 or less runs every update. Decreases shorten the current wait; increases apply after the next batch. No restart required.");
-        foreach (var entry in new[] { BatchSize, PauseUpdates })
-            if (saved[entry.Definition.Key] is { } value) entry.SetSerializedValue(value);
-        if (migrated) config.Save();
     }
     internal static Action<Exception>? ReportError;
     internal static readonly ConditionalWeakTable<ContactsDialog, Loading> Pending = new();

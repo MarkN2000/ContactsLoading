@@ -191,23 +191,8 @@ internal static class Program
             Check(ContactsPatches.BatchSize.Value == 3 && ContactsPatches.PauseUpdates.Value == 2, "両設定の保存と再読込");
             Check(state.TakeBatch(int.MaxValue) == (13, 100), "大きな予算でも全件数を超えない");
             Check(state.TakeBatch(10) == (100, 100), "完了後は進まない");
-            File.WriteAllText(path, "[生成]\n1更新あたりの件数 = 10\n");
-            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
-            Check(ContactsPatches.BatchSize.Value == 10 && ContactsPatches.PauseUpdates.Value == 1,
-                "旧設定の件数を保持し、新しい休止設定には既定値を使う");
             Check((int)ContactsPatches.BatchSize.DefaultValue == 5 && (int)ContactsPatches.PauseUpdates.DefaultValue == 1,
-                "移行した保存値をリセット先の既定値にしない");
-            Check(!File.ReadAllText(path).Contains("生成") && File.ReadAllText(path).Contains("Batch size = 10"),
-                "移行を保存して日本語キーを設定ファイルから除去");
-            File.WriteAllText(path, "[生成]\n1更新あたりの件数 = 3\n処理間に休む更新回数 = 2\n");
-            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
-            Check(ContactsPatches.BatchSize.Value == 3 && ContactsPatches.PauseUpdates.Value == 2, "両方の旧設定を移行");
-            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
-            Check(ContactsPatches.BatchSize.Value == 3 && ContactsPatches.PauseUpdates.Value == 2, "移行後の再読込でも値を保持");
-            File.WriteAllText(path, "[生成]\n1更新あたりの件数 = 10\n処理間に休む更新回数 = 2\n[Loading]\nBatch size = 4\nUpdates to skip = 0\n");
-            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
-            Check(ContactsPatches.BatchSize.Value == 4 && ContactsPatches.PauseUpdates.Value == 0,
-                "新旧キーの併存時は英語側を優先し、0も保持");
+                "保存値の変更後もリセット先の既定値は5・1");
         }
         finally { File.Delete(path); ContactsPatches.BatchSize.Value = 10; ContactsPatches.PauseUpdates.Value = 0; }
     }

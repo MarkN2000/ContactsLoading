@@ -152,6 +152,7 @@ internal static class Program
             CheckSelection(manager, Data);
             CheckRestoring(manager, Data);
             CheckSpacer(manager, current, Data);
+            CheckPauses(manager, Data);
         }
         finally { boundary.UnpatchSelf(); ContactsPatches.ReportError = null; }
 
@@ -174,20 +175,133 @@ internal static class Program
         {
             var config = new ConfigFile(path, false) { SaveOnConfigSet = false };
             ContactsPatches.BindSettings(config);
-            Check(config.Count == 1 && ContactsPatches.BatchSize.Value == 10, "設定は件数だけ、初期値10");
+            Check(config.Count == 2 && ContactsPatches.BatchSize.Value == 5 && ContactsPatches.PauseUpdates.Value == 1,
+                "設定の既定値は5件・1更新休止");
             var state = new ContactsPatches.Loading(Empty<ContactManager>(), _ => { }) {
                 Contacts = Enumerable.Repeat<ContactData>(null!, 100).ToList() };
             Check(state.TakeBatch(10) == (0, 10), "予算10件で進む");
             ContactsPatches.BatchSize.Value = 3;
+            ContactsPatches.PauseUpdates.Value = 2;
             Check(state.TakeBatch(3) == (10, 13), "残り予算3件で進む");
             Check(state.TakeBatch(0) == (13, 13), "検索で使い切った更新では生成しない");
             config.Save();
             ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
-            Check(ContactsPatches.BatchSize.Value == 3, "標準設定の保存と再読込");
+            Check(ContactsPatches.BatchSize.Value == 3 && ContactsPatches.PauseUpdates.Value == 2, "両設定の保存と再読込");
             Check(state.TakeBatch(int.MaxValue) == (13, 100), "大きな予算でも全件数を超えない");
             Check(state.TakeBatch(10) == (100, 100), "完了後は進まない");
+            File.WriteAllText(path, "[生成]\n1更新あたりの件数 = 10\n");
+            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
+            Check(ContactsPatches.BatchSize.Value == 10 && ContactsPatches.PauseUpdates.Value == 1,
+                "旧設定の件数を保持し、新しい休止設定には既定値を使う");
         }
-        finally { File.Delete(path); ContactsPatches.BatchSize.Value = 10; }
+        finally { File.Delete(path); ContactsPatches.BatchSize.Value = 10; ContactsPatches.PauseUpdates.Value = 0; }
+    }
+
+    private static void CheckPauses(ContactManager manager, Func<string, OnlineStatus, ContactData> data)
+    {
+        var dialog = Empty<ContactsDialog>();
+        AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(dialog, [root]);
+        AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
+        ContactsPatches.Items(dialog) = [];
+        SetListUI(dialog);
+        query = ""; visible = true;
+        ContactsPatches.BatchSize.Value = 5;
+        ContactsPatches.PauseUpdates.Value = 1;
+        var state = new ContactsPatches.Loading(manager, entry => ContactsPatches.Items(dialog)[entry.UserId] = Item(entry))
+            { ReservedRows = 0 };
+        ContactsPatches.Pending.Add(dialog, state);
+        try
+        {
+            Tick(dialog); Tick(dialog);
+            (state.Contacts, state.Order) = ContactsPatches.Prepare(Enumerable.Range(0, 30)
+                .Select(i => data($"pause{i:D2}", OnlineStatus.Offline)).ToList(), _ => 0);
+            Tick(dialog);
+            Check(state.Position == 5 && ContactsPatches.Items(dialog).Count == 5, "準備待ち後も最初の更新ですぐ5件生成");
+            visible = false;
+            Check(!ContactsPatches.BeforeSelect(dialog, "pause29"), "非アクティブ中の未生成相手の選択を保持");
+            Tick(dialog); Tick(dialog);
+            visible = true;
+            int reads = queryReads;
+            Tick(dialog);
+            Check(state.Position == 5 && ContactsPatches.Items(dialog).ContainsKey("pause29") && state.Selection == null,
+                "非アクティブ中に休止は進まず、再開した休止更新でも保留選択は実行");
+            Check(queryReads == reads + 1, "休止更新は選択先の検索判定だけ行う");
+            Check(ContactsPatches.BeforeSelect(dialog, "pause28") && ContactsPatches.Items(dialog).ContainsKey("pause28"),
+                "明示的選択はバッチ間隔を待たず生成");
+            Tick(dialog);
+            Check(state.Position == 10, "1更新休んだ次の更新で続き5件");
+            ContactsPatches.PauseUpdates.Value = 0;
+            Tick(dialog);
+            Check(state.Position == 15, "休止を0に変更すると残り待機も解除");
+            ContactsPatches.PauseUpdates.Value = 2;
+            Tick(dialog);
+            Check(state.Position == 20, "休止回数の増加は次の処理後に適用");
+            reads = queryReads;
+            Tick(dialog); Tick(dialog);
+            Check(state.Position == 20 && queryReads == reads, "指定した2更新は生成・検索文字列取得を休む");
+            Tick(dialog);
+            Check(state.Position == 25, "2更新の休止後に生成を再開");
+            ContactsPatches.SortRequested(dialog) = true;
+            ContactsPatches.PauseUpdates.Value = -1;
+            Check(!Tick(dialog) && !ContactsPatches.Pending.TryGetValue(dialog, out _), "負の休止は0扱い、最終生成更新ではソートしない");
+            Check(Tick(dialog), "完了後の本体ソートを休止設定で遅らせない");
+
+            var searchChanged = AccessTools.MethodDelegate<Action<ContactsDialog, TextEditor>>(AccessTools.DeclaredMethod(typeof(ContactsDialog), "SearchTextChanged"));
+            void Search(string value) { query = value; searchChanged(dialog, Empty<TextEditor>()); }
+            int CountActive() => ContactsPatches.Items(dialog).Values.Count(item => active[item.Slot]);
+            ContactsPatches.PauseUpdates.Value = 1;
+            Search("missing"); Search("");
+            Tick(dialog);
+            Check(CountActive() == 5, "検索解除の初回もすぐ5件再表示");
+            reads = queryReads;
+            Check(Tick(dialog) && CountActive() == 5 && queryReads == reads, "再表示だけの休止では本体ソート要求を通す");
+            Tick(dialog);
+            Check(CountActive() == 10, "検索解除も1更新置きに進む");
+            Search("pause29");
+            Check(CountActive() == 1 && active[ContactsPatches.Items(dialog)["pause29"].Slot], "休止中でも完全一致の検索を即時表示");
+            Search(""); Tick(dialog);
+            Check(CountActive() == 6, "再検索は旧休止を取り消して新しい復帰を開始");
+            ContactsPatches.PauseUpdates.Value = int.MaxValue;
+            Tick(dialog); Tick(dialog);
+            Check(CountActive() == 11, "非常に大きい休止設定も次の処理後に適用");
+            Tick(dialog);
+            Check(CountActive() == 11, "大きな休止設定でもオーバーフローしない");
+            ContactsPatches.PauseUpdates.Value = int.MinValue;
+            Tick(dialog); Tick(dialog);
+            Check(CountActive() == 21, "非常に小さい休止設定も毎更新処理として扱う");
+            ContactsPatches.PauseUpdates.Value = 1;
+            Tick(dialog); Tick(dialog); Tick(dialog);
+            Check(CountActive() == 30 && !ContactsPatches.Restoring.TryGetValue(dialog, out _), "休止を挟んで全件復帰しキューを解放");
+
+            // 初期生成と復帰が重なっても、一つの予算と休止を使う。
+            ContactsPatches.Items(dialog).Clear();
+            foreach (var entry in state.Contacts.Take(3))
+            {
+                var item = Item(entry);
+                ContactsPatches.Items(dialog)[entry.UserId] = item;
+                active[item.Slot] = false;
+                ContactsPatches.QueueRestore(item.Slot, dialog);
+            }
+            state.Position = 3;
+            ContactsPatches.Pending.Add(dialog, state);
+            Tick(dialog);
+            Check(state.Position == 5 && CountActive() == 5, "復帰3件と生成2件を共通予算5件で処理");
+            Tick(dialog);
+            Check(state.Position == 5 && CountActive() == 5, "生成と復帰に共通の休止を1回適用");
+            Tick(dialog);
+            Check(state.Position == 10 && CountActive() == 10, "復帰終了後も同じ間隔で生成を継続");
+            ContactsPatches.OnDispose(dialog);
+            state.Position = 10;
+            ContactsPatches.Pending.Add(dialog, state);
+            Tick(dialog);
+            Check(state.Position == 15, "Dispose後に古い休止を残さない");
+        }
+        finally
+        {
+            ContactsPatches.OnDispose(dialog);
+            ContactsPatches.BatchSize.Value = 10; ContactsPatches.PauseUpdates.Value = 0;
+            visible = true; query = "";
+        }
     }
 
     private static void CheckNativeOrder(ContactManager manager, Func<string, OnlineStatus, ContactData> data)

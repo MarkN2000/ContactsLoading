@@ -4,7 +4,7 @@
 
 A [Resonite](https://resonite.com/) mod that reduces freezing when opening Contacts or clearing a search.
 
-Adjust how many contacts are generated or restored per update in Bepis Mod Settings. Default: **10**.
+Adjust the batch size and update interval in Bepis Mod Settings. Default: **5 contacts per batch, with 1 update skipped between batches**. Existing settings are preserved.
 
 ## License
 

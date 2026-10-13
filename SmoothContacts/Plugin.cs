@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.8", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.9", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -49,11 +49,18 @@ public sealed class Plugin : BasePlugin
 internal static class ContactsPatches
 {
     internal static ConfigEntry<int> BatchSize = null!;
-    internal static void BindSettings(ConfigFile config) => BatchSize = config.Bind("生成", "1更新あたりの件数", 10,
-        "1更新で生成または検索解除の再表示を行う合計件数。通常の検索は即時反映します。次の更新から反映します。1以上を指定してください（0以下は1として扱います）。");
+    internal static ConfigEntry<int> PauseUpdates = null!;
+    internal static void BindSettings(ConfigFile config)
+    {
+        BatchSize = config.Bind("生成", "1更新あたりの件数", 5,
+            "1更新で生成または検索解除の再表示を行う合計件数。通常の検索は即時反映します。次の処理から反映します。0以下は1として扱います。");
+        PauseUpdates = config.Bind("生成", "処理間に休む更新回数", 1,
+            "生成・検索解除の分割処理の間に休む通常更新の回数。0以下は毎更新処理します。再起動不要。減らすと残り待機も短縮し、増やすと次の処理後から反映します。");
+    }
     internal static Action<Exception>? ReportError;
     internal static readonly ConditionalWeakTable<ContactsDialog, Loading> Pending = new();
     internal static readonly ConditionalWeakTable<ContactsDialog, PriorityQueue<ContactItem, long>> Restoring = new();
+    private static readonly ConditionalWeakTable<ContactsDialog, StrongBox<int>> Pauses = new();
     internal static readonly AccessTools.FieldRef<ContactsDialog, Dictionary<string, ContactItem>> Items =
         AccessTools.FieldRefAccess<ContactsDialog, Dictionary<string, ContactItem>>("_contactItems");
     private static readonly AccessTools.FieldRef<ContactsDialog, List<ContactItem>> SearchResults =
@@ -262,36 +269,44 @@ internal static class ContactsPatches
         element.MinHeight.Value = element.PreferredHeight.Value = height;
     }
 
-    // Activeの判定は本体に任せ、検索解除の再表示と生成で件数制限を共有する。
+    // Activeの判定は本体に任せ、検索解除の再表示と生成で件数制限・休止を共有する。
     internal static bool UpdateLoading(ContactsDialog dialog)
     {
         bool loading = Pending.TryGetValue(dialog, out var state);
         bool restoring = Restoring.TryGetValue(dialog, out var changes);
         if (!loading && !restoring) return SortRequested(dialog);
-        int remaining = Math.Max(1, BatchSize.Value);
-        if (restoring)
-        {
-            while (remaining > 0 && changes!.TryDequeue(out var item, out _))
-            {
-                remaining--;
-                try
-                {
-                    if (!item.IsRemoved && !item.Slot.ActiveSelf) item.Slot.ActiveSelf = true;
-                }
-                catch (Exception error) { ReportError?.Invoke(error); }
-            }
-            if (changes!.Count == 0) Restoring.Remove(dialog);
-        }
-        if (!loading) return SortRequested(dialog);
-        if (state!.Contacts == null) return false;
+        int limit = Math.Max(1, BatchSize.Value), remaining = limit;
+        var pause = Pauses.GetValue(dialog, _ => new());
         try
         {
-            string term = NormalizeQuery(Search(dialog).Target.TargetString);
-            if (state.Selection is { } selected)
+            // 待機中も、準備完了・再表示を待っていた選択は先に処理する。
+            if (state?.Contacts != null && state.Selection is { } selected)
             {
                 state.Selection = null;
                 dialog.OpenContactPage(selected);
             }
+            pause.Value = Math.Min(pause.Value, Math.Max(0, PauseUpdates.Value));
+            if (pause.Value > 0)
+            {
+                pause.Value--;
+                return !loading && SortRequested(dialog);
+            }
+            if (restoring)
+            {
+                while (remaining > 0 && changes!.TryDequeue(out var item, out _))
+                {
+                    remaining--;
+                    try
+                    {
+                        if (!item.IsRemoved && !item.Slot.ActiveSelf) item.Slot.ActiveSelf = true;
+                    }
+                    catch (Exception error) { ReportError?.Invoke(error); }
+                }
+                if (changes!.Count == 0) Restoring.Remove(dialog);
+            }
+            if (!loading) return SortRequested(dialog);
+            if (state!.Contacts == null) return false;
+            string term = NormalizeQuery(Search(dialog).Target.TargetString);
             if (state.Position == state.Contacts.Count)
             {
                 foreach (var pair in state.Deferred)
@@ -302,6 +317,7 @@ internal static class ContactsPatches
                 state.Deferred.Clear();
             }
             var (start, end) = state.TakeBatch(remaining);
+            remaining -= end - start;
             for (int i = start; i < end; i++) Generate(dialog, state, state.Contacts[i], term);
             if (state.Position == state.Contacts.Count && state.Deferred.Count == 0) EndLoading(dialog);
             else UpdateSpacer(dialog, state);
@@ -309,6 +325,11 @@ internal static class ContactsPatches
         catch (Exception error)
         {
             Abort(dialog, error);
+        }
+        finally
+        {
+            if (remaining < limit) pause.Value = Math.Max(0, PauseUpdates.Value);
+            if (!Pending.TryGetValue(dialog, out _) && !Restoring.TryGetValue(dialog, out _)) Pauses.Remove(dialog);
         }
         return false;
     }
@@ -373,6 +394,7 @@ internal static class ContactsPatches
     internal static void BeforeSearch(ContactsDialog __instance)
     {
         Restoring.Remove(__instance);
+        Pauses.Remove(__instance);
         if (Pending.TryGetValue(__instance, out var state)) state.ClearSpacer();
     }
 
@@ -420,5 +442,6 @@ internal static class ContactsPatches
     {
         EndLoading(__instance);
         Restoring.Remove(__instance);
+        Pauses.Remove(__instance);
     }
 }

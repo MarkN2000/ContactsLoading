@@ -2,7 +2,7 @@
 
 ![ContactsLoading](https://raw.githubusercontent.com/MarkN2000/ContactsLoading/main/icon.png)
 
-A [Resonite](https://resonite.com/) mod designed to speed up Contacts loading and reduce freezing when opening the tab.
+A [Resonite](https://resonite.com/) mod that reduces freezing when opening the Contacts tab.
 
 Adjust how many contacts are generated per update in Bepis Mod Settings. Default: **10**.
 

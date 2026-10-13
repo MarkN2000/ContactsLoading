@@ -21,7 +21,7 @@ $manifest = [ordered]@{
     name = 'ContactsLoading'
     author = 'markn2000'
     version_number = $version
-    description = 'Speeds up Contacts loading and reduces freezing when opening the tab.'
+    description = 'Reduces freezing when opening the Contacts tab.'
     website_url = 'https://github.com/MarkN2000/ContactsLoading'
     dependencies = $dependencies
 } | ConvertTo-Json

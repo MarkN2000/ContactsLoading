@@ -11,9 +11,9 @@ using FrooxEngine.UIX;
 using HarmonyLib;
 using SkyFrost.Base;
 
-namespace ContactsLoading;
+namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.ContactsLoading", "ContactsLoading", "0.3.0", "markn2000", "https://github.com/MarkN2000/ContactsLoading")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.0", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -33,12 +33,12 @@ public sealed class Plugin : BasePlugin
             if (!File.Exists(Config.ConfigFilePath)) Config.Save();
             ContactsPatches.ReportError = error => Log.LogError($"Contactsの分割生成を中止しました: {error}");
             ContactsPatches.Apply(HarmonyInstance);
-            Log.LogInfo("ContactsLoading: 設定件数ずつ非表示で生成し、優先分・残りの2段階で表示します。");
+            Log.LogInfo("SmoothContacts: 設定件数ずつ非表示で生成し、優先分・残りの2段階で表示します。");
         }
         catch (Exception error)
         {
             HarmonyInstance.UnpatchSelf();
-            Log.LogError($"ContactsLoadingを適用できませんでした。本Modのパッチを解除しました: {error}");
+            Log.LogError($"SmoothContactsを適用できませんでした。本Modのパッチを解除しました: {error}");
         }
     }
 

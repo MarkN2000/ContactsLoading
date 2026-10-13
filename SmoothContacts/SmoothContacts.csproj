@@ -15,6 +15,6 @@
     <Reference Include="$(DevProfile)\BepInEx\core\BepInEx.Core.dll;$(DevProfile)\BepInEx\core\BepInEx.NET.Common.dll;$(DevProfile)\BepInEx\core\0Harmony.dll" Private="false" />
     <Reference Include="$(DevProfile)\BepInEx\plugins\ResoniteModding-BepInExResoniteShim\BepInExResoniteShim\BepInExResoniteShim.dll" Private="false" />
     <Reference Include="$(DevProfile)\BepInEx\plugins\ResoniteModding-BepisResoniteWrapper\BepisResoniteWrapper\BepisResoniteWrapper.dll" Private="false" />
-    <InternalsVisibleTo Include="ContactsLoading.Checks" />
+    <InternalsVisibleTo Include="SmoothContacts.Checks" />
   </ItemGroup>
 </Project>

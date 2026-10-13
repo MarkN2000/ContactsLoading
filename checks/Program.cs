@@ -3,7 +3,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using BepInEx.Configuration;
-using ContactsLoading;
+using SmoothContacts;
 using FrooxEngine;
 using FrooxEngine.UIX;
 using HarmonyLib;
@@ -161,7 +161,7 @@ internal static class Program
 
         CheckPublication(manager, Data);
 
-        var harmony = new Harmony("ContactsLoading.Checks");
+        var harmony = new Harmony("SmoothContacts.Checks");
         try
         {
             ContactsPatches.Apply(harmony);
@@ -175,7 +175,7 @@ internal static class Program
 
     private static void CheckSettings()
     {
-        string path = Path.Combine(Path.GetTempPath(), $"ContactsLoading-check-{Guid.NewGuid():N}.cfg");
+        string path = Path.Combine(Path.GetTempPath(), $"SmoothContacts-check-{Guid.NewGuid():N}.cfg");
         try
         {
             var config = new ConfigFile(path, false) { SaveOnConfigSet = false };
@@ -210,7 +210,7 @@ internal static class Program
     private static void CheckPublication(ContactManager manager, Func<string, OnlineStatus, ContactData> data)
     {
         // エンジンを起動せず、表示値の書込み・予約・ソートの境界だけを検査プロセス内で置換する。
-        var harmony = new Harmony("ContactsLoading.Checks.Display");
+        var harmony = new Harmony("SmoothContacts.Checks.Display");
         void Patch(MethodInfo target, string prefix) => harmony.Patch(target, prefix: new HarmonyMethod(typeof(Program), prefix));
         try
         {

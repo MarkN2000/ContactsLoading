@@ -8,7 +8,7 @@
     <DevProfile Condition="'$(DevProfile)' == ''">$(APPDATA)\com.kesomannen.gale\resonite\profiles\Mod開発</DevProfile>
   </PropertyGroup>
   <ItemGroup>
-    <ProjectReference Include="..\ContactsLoading\ContactsLoading.csproj" />
+    <ProjectReference Include="..\SmoothContacts\SmoothContacts.csproj" />
     <Reference Include="$(GamePath)\FrooxEngine.dll;$(GamePath)\Elements.Core.dll;$(GamePath)\SkyFrost.Base.dll;$(GamePath)\SkyFrost.Base.Models.dll" Private="false" />
     <Reference Include="$(DevProfile)\BepInEx\core\0Harmony.dll;$(DevProfile)\BepInEx\core\BepInEx.Core.dll" Private="false" />
   </ItemGroup>

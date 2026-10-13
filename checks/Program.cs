@@ -16,11 +16,16 @@ internal static class Program
     private static readonly TextField search = Empty<TextField>();
     private static readonly Dictionary<Slot, ContactItem> rows = [];
     private static readonly Dictionary<Slot, bool> active = [];
+    private static readonly Dictionary<Slot, long> orders = [];
+    private static readonly List<Slot> changed = [];
     private static readonly Dictionary<SyncRef<Text>, Text> texts = [];
     private static readonly List<string> selections = [];
     private static string query = "";
     private static bool visible = true;
     private static int activeWrites;
+    private static int queryReads;
+    private static Slot? failWrite;
+    private static Func<Component, bool> canRun = null!;
 
     private static void Main(string[] args)
     {
@@ -60,29 +65,31 @@ internal static class Program
             var visited = new List<int>();
             while (state.Position < count)
             {
-                var (start, end) = state.TakeBatch();
+                var (start, end) = state.TakeBatch(10);
                 Check(end > start && end - start <= 10, "1更新最大10件、必ず進む");
                 visited.AddRange(Enumerable.Range(start, end - start));
             }
             Check(visited.SequenceEqual(Enumerable.Range(0, count)), "全件を1回ずつ走査");
         }
-        Check(ContactsPatches.MatchesSearch("Alice", [], " AL "), "検索の前後空白・大小文字");
+        Check(ContactsPatches.MatchesSearch("Alice", [], ContactsPatches.NormalizeQuery(" AL ")), "検索の前後空白・大小文字");
         Check(ContactsPatches.MatchesSearch("Alice", ["別名"], "別"), "別名の前方一致");
         Check(!ContactsPatches.MatchesSearch("Alice", [], "lic"), "部分一致には変えない");
-        Check(ContactsPatches.MatchesSearch("Alice", [], "  "), "空の検索");
+        Check(ContactsPatches.MatchesSearch("Alice", [], ContactsPatches.NormalizeQuery("  ")), "空の検索");
+        Check(ContactsPatches.NormalizeQuery(null) == "", "nullも検索解除");
 
-        foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "OnActivated", "UpdateContactItem" })
+        foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "OnActivated", "UpdateContactItem", "SearchTextChanged" })
         {
             var method = AccessTools.DeclaredMethod(typeof(ContactsDialog), name);
             var original = PatchProcessor.GetOriginalInstructions(method).ToList();
             int length = original.Count;
             Func<IEnumerable<CodeInstruction>, IEnumerable<CodeInstruction>> transform = name switch {
                 "OnAttach" => ContactsPatches.TranspileAttach, "UpdateContactItem" => ContactsPatches.TranspileItem,
+                "SearchTextChanged" => ContactsPatches.TranspileSearch,
                 _ => code => ContactsPatches.TranspileSort(code, method) };
             var changed = transform(original).ToList();
-            Check(changed.Count == length + (name == "UpdateContactItem" ? 1 : 0), "ILの追加は必要な引数だけ");
+            Check(changed.Count == length + (name == "UpdateContactItem" ? 1 : name == "SearchTextChanged" ? 2 : 0), "ILの追加は必要な引数だけ");
             Check(changed.Count(op => op.operand is MethodInfo m && m.DeclaringType == typeof(ContactsPatches))
-                == (name == "UpdateContactItem" ? 2 : 1), "生成とソート要求の必要箇所だけ差し替え");
+                == (name is "UpdateContactItem" or "SearchTextChanged" ? 2 : 1), "生成・ソート・検索の必要箇所だけ差し替え");
             Reject(() => transform([]).ToList());
             var doubled = PatchProcessor.GetOriginalInstructions(method).ToList();
             Reject(() => transform(doubled.Concat(doubled)).ToList());
@@ -100,10 +107,14 @@ internal static class Program
         void Patch(MethodInfo target, string prefix) => boundary.Patch(target, prefix: new HarmonyMethod(typeof(Program), prefix));
         try
         {
+            canRun = AccessTools.MethodDelegate<Func<Component, bool>>(AccessTools.DeclaredPropertyGetter(typeof(Component), "CanRunUpdates"));
             Patch(AccessTools.PropertyGetter(typeof(Slot), "IsActive"), nameof(IsActive));
+            Patch(AccessTools.PropertyGetter(typeof(Slot), "ActiveSelf"), nameof(GetActive));
+            Patch(AccessTools.PropertyGetter(typeof(Slot), "OrderOffset"), nameof(GetOrder));
             Patch(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf"), nameof(SetActive));
             Patch(AccessTools.PropertyGetter(typeof(SyncRef<Text>), "Target"), nameof(GetText));
             Patch(AccessTools.PropertyGetter(typeof(TextField), "TargetString"), nameof(GetQuery));
+            Patch(AccessTools.PropertyGetter(typeof(TextEditor), "TargetString"), nameof(GetQuery));
             var getItem = typeof(ContainerWorker<Component>).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly)
                 .Single(m => m.Name == "GetComponent" && m.IsGenericMethodDefinition)
                 .MakeGenericMethod(typeof(ContactItem));
@@ -113,7 +124,11 @@ internal static class Program
             // 参照型のジェネリックgetterは実行コードを共有するため、検査の段階ごとに置換する。
             boundary.Unpatch(AccessTools.PropertyGetter(typeof(SyncRef<Text>), "Target"), HarmonyPatchType.All, boundary.Id);
             Patch(AccessTools.PropertyGetter(typeof(SyncRef<TextField>), "Target"), nameof(GetSearch));
+            boundary.Patch(AccessTools.DeclaredMethod(typeof(ContactsDialog), "SearchTextChanged"),
+                prefix: new HarmonyMethod(typeof(ContactsPatches), nameof(ContactsPatches.BeforeSearch)),
+                transpiler: new HarmonyMethod(typeof(ContactsPatches), nameof(ContactsPatches.TranspileSearch)));
             CheckLoading(manager, current, Data);
+            CheckFiltering(manager, Data);
         }
         finally { boundary.UnpatchSelf(); ContactsPatches.ReportError = null; }
 
@@ -121,7 +136,7 @@ internal static class Program
         try
         {
             ContactsPatches.Apply(harmony);
-            foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "OnActivated", "UpdateContactItem", "OpenContactPage", "set_SelectedContactId", "OnDispose" })
+            foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "OnActivated", "UpdateContactItem", "OpenContactPage", "set_SelectedContactId", "SearchTextChanged", "OnDispose" })
                 Check(Harmony.GetPatchInfo(AccessTools.DeclaredMethod(typeof(ContactsDialog), name))?.Owners.Contains(harmony.Id) == true,
                     $"実DLLへのパッチ適用: {name}");
         }
@@ -139,21 +154,15 @@ internal static class Program
             Check(config.Count == 1 && ContactsPatches.BatchSize.Value == 10, "設定は件数だけ、初期値10");
             var state = new ContactsPatches.Loading(Empty<ContactManager>(), _ => { }) {
                 Contacts = Enumerable.Repeat<ContactData>(null!, 100).ToList() };
-            Check(state.TakeBatch() == (0, 10), "初期値で10件ずつ進む");
+            Check(state.TakeBatch(10) == (0, 10), "予算10件で進む");
             ContactsPatches.BatchSize.Value = 3;
-            Check(state.TakeBatch() == (10, 13), "途中変更を次のバッチへ反映");
+            Check(state.TakeBatch(3) == (10, 13), "残り予算3件で進む");
+            Check(state.TakeBatch(0) == (13, 13), "検索で使い切った更新では生成しない");
             config.Save();
             ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
             Check(ContactsPatches.BatchSize.Value == 3, "標準設定の保存と再読込");
-            foreach (int value in new[] { 0, -1, int.MinValue })
-            {
-                ContactsPatches.BatchSize.Value = value;
-                var (start, end) = state.TakeBatch();
-                Check(end == start + 1, "0以下でも1件ずつ進む");
-            }
-            ContactsPatches.BatchSize.Value = int.MaxValue;
-            Check(state.TakeBatch() == (16, 100), "大きな件数でも全件数を超えない");
-            Check(state.TakeBatch() == (100, 100), "完了後は進まない");
+            Check(state.TakeBatch(int.MaxValue) == (13, 100), "大きな予算でも全件数を超えない");
+            Check(state.TakeBatch(10) == (100, 100), "完了後は進まない");
         }
         finally { File.Delete(path); ContactsPatches.BatchSize.Value = 10; }
     }
@@ -209,7 +218,6 @@ internal static class Program
             created.Add(entry.UserId);
             if (entry.UserId == "nested") ContactsPatches.SortRequested(dialog) = true;
             ContactsPatches.RequestItemSort(dialog, true);
-            AccessTools.Method(typeof(ContactsPatches), "AfterItem").Invoke(null, [dialog, entry]);
         }
         var state = new ContactsPatches.Loading(manager, Update);
         ContactsPatches.Pending.Add(dialog, state);
@@ -223,7 +231,7 @@ internal static class Program
         visible = false;
         ContactsPatches.RequestActivationSort(dialog, true);
         Check(!ContactsPatches.SortRequested(dialog), "生成中の再表示ソート要求を除く");
-        for (int i = 0; i < 3; i++) Check(!ContactsPatches.UpdateLoading(dialog) && created.Count == 10 && state.Position == 10, "親が非アクティブなら位置を進めず生成しない");
+        for (int i = 0; i < 3; i++) Check(!Tick(dialog) && created.Count == 10 && state.Position == 10, "親が非アクティブなら本体の判定で生成停止");
         Check(!ContactsPatches.BeforeSelect(dialog, "row30"), "非アクティブ中の選択を保留");
         visible = true;
         query = "row2";
@@ -279,6 +287,107 @@ internal static class Program
         Check(ReferenceEquals(reported, failure) && !failed.Creating && !ContactsPatches.Pending.TryGetValue(dialog, out _) && ContactsPatches.SortRequested(dialog), "例外で記録・状態解放・本体ソートへ復帰");
     }
 
+    private static void CheckFiltering(ContactManager manager, Func<string, OnlineStatus, ContactData> data)
+    {
+        rows.Clear(); active.Clear(); orders.Clear(); changed.Clear();
+        query = ""; visible = true;
+        var dialog = Empty<ContactsDialog>();
+        AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(dialog, [root]);
+        AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
+        AccessTools.Field(typeof(ContactsDialog), "_searchResultItems").SetValue(dialog, new List<ContactItem>());
+        ContactsPatches.Items(dialog) = [];
+        var errors = new List<Exception>();
+        ContactsPatches.ReportError = errors.Add;
+        var searchChanged = AccessTools.MethodDelegate<Action<ContactsDialog, TextEditor>>(AccessTools.DeclaredMethod(typeof(ContactsDialog), "SearchTextChanged"));
+        void Search(string value) { query = value; searchChanged(dialog, Empty<TextEditor>()); }
+        int CountActive() => ContactsPatches.Items(dialog).Values.Count(item => active[item.Slot]);
+        int Waiting() => ContactsPatches.Filtering.TryGetValue(dialog, out var queue) ? queue.Count : 0;
+        void Drain()
+        {
+            for (int updates = 0; Waiting() > 0; updates++)
+            {
+                Check(updates < 100, "検索の保留が有限回で完了");
+                int writes = activeWrites;
+                Tick(dialog);
+                Check(activeWrites - writes <= Math.Max(1, ContactsPatches.BatchSize.Value), "検索の表示変更も設定件数以内");
+            }
+        }
+        for (int i = 0; i < 25; i++)
+        {
+            var item = Item(data($"filter{i:D2}", OnlineStatus.Offline));
+            ContactsPatches.Items(dialog)[item.Data.UserId] = item;
+            orders[item.Slot] = (24 - i) * 100L;
+        }
+        Search(" FILTER ");
+        Check(Waiting() == 0 && changed.Count == 0, "一致状態が変わらない検索は保留もActive書込みもない");
+        Search("missing");
+        Check(Waiting() == 25 && CountActive() == 25 && changed.Count == 0, "実DLLの検索は一括OFFせず対象だけ保留");
+        queryReads = 0;
+        Tick(dialog);
+        Check(Waiting() == 15 && CountActive() == 15 && queryReads == 1, "1更新10件、検索文字列はバッチに1回だけ取得");
+        Check(changed.Select(slot => rows[slot].Data.UserId).SequenceEqual(Enumerable.Range(15, 10).Reverse().Select(i => $"filter{i:D2}")),
+            "辞書の挿入順ではなく現在のOrderOffset順で切り替える");
+        Search("");
+        Check(Waiting() == 10 && CountActive() == 15, "空欄で旧検索を破棄し、実際に隠れている10件だけ復帰待ち");
+        Tick(dialog);
+        Check(Waiting() == 0 && CountActive() == 25 && !ContactsPatches.SortRequested(dialog), "空欄への復帰後に追加ソートしない");
+
+        Search("filter0"); Tick(dialog); Search("filter2"); Drain();
+        Check(CountActive() == 5 && ContactsPatches.Items(dialog).Values.Where(item => active[item.Slot]).All(item => item.Username.StartsWith("filter2")),
+            "連続入力では新しい検索条件だけが最後に残る");
+        Search("");
+        visible = false;
+        int before = activeWrites;
+        for (int i = 0; i < 3; i++) Tick(dialog);
+        Check(activeWrites == before && Waiting() == 20, "検索解除途中も非アクティブ中は停止");
+        visible = true;
+        ContactsPatches.BatchSize.Value = 3; Tick(dialog);
+        Check(CountActive() == 8 && Waiting() == 17, "検索解除の件数変更を次の更新へ反映");
+        ContactsPatches.BatchSize.Value = 10; Drain();
+        Check(CountActive() == 25, "再表示で検索解除を最後まで再開");
+        Search("missing"); Search("");
+        Check(Waiting() == 0 && CountActive() == 25, "未処理の検索を取り消した場合は余分な切り替えをしない");
+        foreach (int value in new[] { 0, -1, int.MinValue })
+        {
+            Search("missing"); ContactsPatches.BatchSize.Value = value; Tick(dialog);
+            Check(CountActive() == 24 && Waiting() == 24, "0以下の設定でも1件ずつ進む");
+            ContactsPatches.BatchSize.Value = int.MaxValue; Drain(); Search(""); Tick(dialog);
+            Check(CountActive() == 25 && Waiting() == 0, "大きな設定でも対象件数で終了");
+        }
+        ContactsPatches.BatchSize.Value = 10;
+        Search("missing");
+        var removed = ContactsPatches.Items(dialog)["filter24"];
+        AccessTools.PropertySetter(typeof(Worker), "IsDisposed").Invoke(removed, [true]);
+        ContactsPatches.Items(dialog).Remove("filter24"); active.Remove(removed.Slot);
+        var renamed = ContactsPatches.Items(dialog)["filter23"];
+        AccessTools.Field(typeof(SyncField<string>), "_value").SetValue(AccessTools.Field(typeof(ContactItem), "_rawUsername").GetValue(renamed), "missing");
+        Drain();
+        Check(errors.Count == 0 && CountActive() == 1 && active[renamed.Slot], "保留中の削除を飛ばし、名前変更後の検索条件を再評価");
+
+        ContactsPatches.Items(dialog).Clear(); rows.Clear(); active.Clear(); orders.Clear(); query = "";
+        for (int i = 0; i < 3; i++)
+        {
+            var item = Item(data($"existing{i}", OnlineStatus.Offline));
+            ContactsPatches.Items(dialog)[item.Data.UserId] = item;
+        }
+        int generated = 0;
+        var state = new ContactsPatches.Loading(manager, entry => { ContactsPatches.Items(dialog)[entry.UserId] = Item(entry); generated++; });
+        (state.Contacts, state.Order) = ContactsPatches.Prepare(Enumerable.Range(0, 10).Select(i => data($"new{i}", OnlineStatus.Offline)).ToList(), _ => 0);
+        ContactsPatches.Pending.Add(dialog, state);
+        Search("new"); before = activeWrites; queryReads = 0; Tick(dialog);
+        Check(generated == 7 && activeWrites - before == 3 && queryReads == 1, "表示変更3件と生成7件で合計10件、文字列の再取得なし");
+        Check(CountActive() == 7 && !ContactsPatches.SortRequested(dialog), "生成した7行はその更新で表示し、全行完成を待たない");
+        Search(""); Tick(dialog);
+        Check(generated == 10 && CountActive() == 13 && Waiting() == 0 && !ContactsPatches.Pending.TryGetValue(dialog, out _), "共有処理で生成と検索解除を両方完了");
+        Search("missing");
+        failWrite = ContactsPatches.Items(dialog)["existing0"].Slot;
+        Drain(); failWrite = null;
+        Check(errors.Count == 1 && CountActive() == 1, "個別行の反映例外を記録して他の行の処理を継続");
+        Search(""); ContactsPatches.Pending.Add(dialog, state);
+        ContactsPatches.OnDispose(dialog);
+        Check(!ContactsPatches.Pending.TryGetValue(dialog, out _) && Waiting() == 0, "Disposeで生成と検索の両方を解放");
+    }
+
     private static ContactItem Item(ContactData data, bool unread = false)
     {
         var slot = Empty<Slot>();
@@ -299,17 +408,21 @@ internal static class Program
         texts[unreadRef] = unreadText;
         rows[slot] = item;
         active[slot] = true;
+        orders[slot] = rows.Count * 100L;
         return item;
     }
 
     private static bool IsActive(ref bool __result) { __result = visible; return false; }
-    private static bool SetActive(Slot __instance, bool __0) { activeWrites++; active[__instance] = __0; return false; }
+    private static bool GetActive(Slot __instance, ref bool __result) { __result = active[__instance]; return false; }
+    private static bool GetOrder(Slot __instance, ref long __result) { __result = orders[__instance]; return false; }
+    private static bool SetActive(Slot __instance, bool __0) { if (__instance == failWrite) throw new InvalidOperationException("検査用の反映エラー"); activeWrites++; active[__instance] = __0; changed.Add(__instance); return false; }
     private static bool GetSearch(ref TextField __result) { __result = search; return false; }
     private static bool GetText(SyncRef<Text> __instance, ref Text __result) { __result = texts[__instance]; return false; }
-    private static bool GetQuery(ref string __result) { __result = query; return false; }
+    private static bool GetQuery(ref string __result) { queryReads++; __result = query; return false; }
     private static bool GetItem(Slot __instance, ref ContactItem __result) { __result = rows[__instance]; return false; }
     private static bool OpenPage(ContactsDialog __instance, string __0) { selections.Add(__0); Check(ContactsPatches.BeforeSelect(__instance, __0), "再開時の選択は本体へ通す"); return false; }
     private static T Empty<T>() where T : class => (T)RuntimeHelpers.GetUninitializedObject(typeof(T));
+    private static bool Tick(ContactsDialog dialog) => canRun(dialog) && ContactsPatches.UpdateLoading(dialog);
     private static void Check(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); assertions++; }
     private static void Reject(Action action)
     {

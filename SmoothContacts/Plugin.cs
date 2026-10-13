@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.1", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.2", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -33,7 +33,7 @@ public sealed class Plugin : BasePlugin
             if (!File.Exists(Config.ConfigFilePath)) Config.Save();
             ContactsPatches.ReportError = error => Log.LogError($"Contactsの分割生成を中止しました: {error}");
             ContactsPatches.Apply(HarmonyInstance);
-            Log.LogInfo("SmoothContacts検証版: 最初からActive ONで分割生成します。最後の全体ソートは維持します。");
+            Log.LogInfo("SmoothContacts: 本体の順序で、アクティブ中だけ分割生成します。");
         }
         catch (Exception error)
         {
@@ -48,8 +48,6 @@ public sealed class Plugin : BasePlugin
 
 internal static class ContactsPatches
 {
-    // 検証版の切り替え。表示タイミングだけを変えて比較する。
-    internal static readonly bool ActiveFromStart = true;
     internal static ConfigEntry<int> BatchSize = null!;
     internal static void BindSettings(ConfigFile config) => BatchSize = config.Bind("生成", "1更新あたりの件数", 10,
         "1更新で生成する最大件数。少ないほど負荷を分散し、多いほど生成が早く完了します。次の分割生成から反映します。1以上を指定してください（0以下は1として扱います）。");
@@ -61,8 +59,6 @@ internal static class ContactsPatches
         AccessTools.FieldRefAccess<ContactsDialog, bool>("sortList");
     private static readonly AccessTools.FieldRef<ContactsDialog, SyncRef<TextField>> Search =
         AccessTools.FieldRefAccess<ContactsDialog, SyncRef<TextField>>("_searchBar");
-    private static readonly AccessTools.FieldRef<ContactsDialog, SyncRef<Slot>> ListRoot =
-        AccessTools.FieldRefAccess<ContactsDialog, SyncRef<Slot>>("_listRoot");
     private static readonly AccessTools.FieldRef<ContactsDialog, UIBuilder> ListUI =
         AccessTools.FieldRefAccess<ContactsDialog, UIBuilder>("listUi");
     private static readonly Func<ContactsDialog, ContactItem> AddItem =
@@ -77,19 +73,20 @@ internal static class ContactsPatches
 
         var attach = Target("OnAttach");
         var commonUpdate = Target("OnCommonUpdate");
+        var activated = Target("OnActivated");
         var updateItem = Target("UpdateContactItem", typeof(ContactData));
         var openPage = Target("OpenContactPage", typeof(string));
         var selectId = Target("set_SelectedContactId", typeof(string));
         var dispose = Target("OnDispose");
-        var search = Target("SearchTextChanged", typeof(TextEditor));
         // 適用前に、元のDLLの差し替え箇所も検査する。
         TranspileAttach(PatchProcessor.GetOriginalInstructions(attach)).ToList();
-        TranspileSort(PatchProcessor.GetOriginalInstructions(commonUpdate)).ToList();
+        TranspileSort(PatchProcessor.GetOriginalInstructions(commonUpdate), commonUpdate).ToList();
+        TranspileSort(PatchProcessor.GetOriginalInstructions(activated), activated).ToList();
         TranspileItem(PatchProcessor.GetOriginalInstructions(updateItem)).ToList();
         harmony.Patch(attach, transpiler: Patch(nameof(TranspileAttach)));
         harmony.Patch(commonUpdate, transpiler: Patch(nameof(TranspileSort)));
-        harmony.Patch(updateItem, transpiler: Patch(nameof(TranspileItem)), postfix: Patch(nameof(AfterItem)));
-        harmony.Patch(search, postfix: Patch(nameof(AfterSearch)));
+        harmony.Patch(activated, transpiler: Patch(nameof(TranspileSort)));
+        harmony.Patch(updateItem, prefix: Patch(nameof(BeforeItem)), transpiler: Patch(nameof(TranspileItem)), postfix: Patch(nameof(AfterItem)));
         harmony.Patch(openPage, prefix: Patch(nameof(BeforeSelect)));
         harmony.Patch(selectId, prefix: Patch(nameof(BeforeSelect)));
         harmony.Patch(dispose, prefix: Patch(nameof(OnDispose)));
@@ -113,20 +110,19 @@ internal static class ContactsPatches
         return code;
     }
 
-    internal static IEnumerable<CodeInstruction> TranspileSort(IEnumerable<CodeInstruction> instructions)
+    internal static IEnumerable<CodeInstruction> TranspileSort(IEnumerable<CodeInstruction> instructions, MethodBase __originalMethod)
     {
         var code = instructions.ToList();
         var field = AccessTools.Field(typeof(ContactsDialog), "sortList");
-        var matches = code.Where(op => op.opcode == OpCodes.Ldfld && Equals(op.operand, field)).ToArray();
+        bool writing = __originalMethod.Name != "OnCommonUpdate";
+        var matches = code.Where(op => op.opcode == (writing ? OpCodes.Stfld : OpCodes.Ldfld) && Equals(op.operand, field)).ToArray();
         if (matches.Length != 1)
             throw new InvalidOperationException($"ソート判定が一意ではありません: {matches.Length}");
         matches[0].opcode = OpCodes.Call;
-        matches[0].operand = AccessTools.Method(typeof(ContactsPatches), nameof(ShouldSort));
+        matches[0].operand = AccessTools.Method(typeof(ContactsPatches), !writing ? nameof(UpdateLoading)
+            : __originalMethod.Name == "OnActivated" ? nameof(RequestActivationSort) : nameof(RequestItemSort));
         return code;
     }
-
-    internal static int Priority(int unread, OnlineStatus status) => unread > 0 ? 0
-        : status is OnlineStatus.Sociable or OnlineStatus.Online or OnlineStatus.Away or OnlineStatus.Busy ? 1 : 2;
 
     internal static IEnumerable<CodeInstruction> TranspileItem(IEnumerable<CodeInstruction> instructions)
     {
@@ -143,10 +139,10 @@ internal static class ContactsPatches
         call.opcode = OpCodes.Call;
         call.operand = AccessTools.Method(typeof(ContactsPatches), nameof(CreateItem));
         code.Insert(index, data);
-        return code;
+        return TranspileSort(code, AccessTools.DeclaredMethod(typeof(ContactsDialog), "UpdateContactItem"));
     }
 
-    // 対象版の本体と同じ比較キー。事前処理では値を固定し、完成時には現在値を使う。
+    // 対象版の本体と同じ比較キー。事前処理で値を固定する。
     internal static (int Unread, int Category, long MessageTime, string Name) SortKey(
         Contact contact, OnlineStatus status, bool unread)
     {
@@ -156,7 +152,7 @@ internal static class ContactsPatches
         return (unread ? 0 : 1, category, -contact.LatestMessageTime.Ticks, contact.ContactUsername);
     }
 
-    internal static (List<ContactData> Contacts, int PriorityEnd, Dictionary<string, int> Order) Prepare(
+    internal static (List<ContactData> Contacts, Dictionary<string, int> Order) Prepare(
         List<ContactData> snapshot, Func<ContactData, int> unreadCount)
     {
         var sorted = snapshot.Select(data =>
@@ -164,9 +160,9 @@ internal static class ContactsPatches
             var contact = data.Contact;
             var status = data.CurrentStatus?.OnlineStatus ?? OnlineStatus.Offline;
             int unread = unreadCount(data);
-            return (Data: data, Group: Priority(unread, status), Key: SortKey(contact, status, unread > 0));
-        }).OrderBy(entry => entry.Group).ThenBy(entry => entry.Key).ToArray();
-        return (sorted.Select(entry => entry.Data).ToList(), sorted.Count(entry => entry.Group < 2),
+            return (Data: data, Key: SortKey(contact, status, unread > 0));
+        }).OrderBy(entry => entry.Key).ToArray();
+        return (sorted.Select(entry => entry.Data).ToList(),
             sorted.Select((entry, index) => (entry.Data.UserId, index)).ToDictionary(entry => entry.UserId, entry => entry.index));
     }
 
@@ -180,12 +176,12 @@ internal static class ContactsPatches
         }
         var state = new Loading(manager, update);
         Pending.Add(dialog, state);
-        state.Tick = () => RunBatch(dialog, state);
+        SortRequested(dialog) = false;
         var messages = dialog.Cloud.Messages;
         dialog.StartTask(async () =>
         {
             Exception? failure = null;
-            (List<ContactData> Contacts, int PriorityEnd, Dictionary<string, int> Order) prepared = ([], 0, []);
+            (List<ContactData> Contacts, Dictionary<string, int> Order) prepared = ([], []);
             try
             {
                 await default(ToBackground);
@@ -200,13 +196,9 @@ internal static class ContactsPatches
             try
             {
                 if (failure != null) throw failure;
-                (state.Contacts, state.PriorityEnd, state.Order) = prepared;
-                // 事前処理中に通常イベントで作られた行も、公開前に順序を確定する。
-                foreach (var pair in state.Hidden)
-                    if (!pair.Value.IsDestroyed) pair.Value.OrderOffset = state.RowOrder(pair.Key);
-                dialog.RunInUpdates(1, state.Tick);
+                (state.Contacts, state.Order) = prepared;
             }
-            catch (Exception error) { Abort(dialog, state, error); }
+            catch (Exception error) { Abort(dialog, error); }
         });
     }
 
@@ -214,73 +206,101 @@ internal static class ContactsPatches
     {
         internal readonly ContactManager Manager = manager;
         internal readonly Action<ContactData> Update = update;
-        internal List<ContactData> Contacts = [];
-        internal int PriorityEnd;
+        internal List<ContactData>? Contacts;
         internal Dictionary<string, int> Order = [];
-        internal readonly Dictionary<string, Slot> Hidden = [];
+        internal readonly Dictionary<string, ContactData> Deferred = [];
         internal int Position;
+        internal bool Creating;
+        internal string? Selection;
         private long extraRows;
-        internal Action Tick = null!;
-
-        internal long RowOrder(string id) => (Order.TryGetValue(id, out int index) ? index : Contacts.Count + extraRows++) * 100L;
+        internal long RowOrder(string id) => (Order.TryGetValue(id, out int index) ? index : Contacts!.Count + extraRows++) * 100L;
 
         internal (int Start, int End) TakeBatch()
         {
             int start = Position;
-            int limit = Position < PriorityEnd ? PriorityEnd : Contacts.Count;
-            Position += Math.Min(Math.Max(1, BatchSize.Value), limit - Position);
+            Position += Math.Min(Math.Max(1, BatchSize.Value), Contacts!.Count - Position);
             return (start, Position);
         }
     }
 
-    private static void RunBatch(ContactsDialog dialog, Loading state)
+    // 通常更新のソート判定を差し替え、初期生成中だけ同じ更新内で行を追加する。
+    internal static bool UpdateLoading(ContactsDialog dialog)
     {
-        if (!Pending.TryGetValue(dialog, out var current) || current != state) return;
+        if (!Pending.TryGetValue(dialog, out var state)) return SortRequested(dialog);
+        if (state.Contacts == null || !dialog.Slot.IsActive) return false;
         try
         {
+            if (state.Selection is { } selected)
+            {
+                state.Selection = null;
+                dialog.OpenContactPage(selected);
+            }
+            if (state.Position == state.Contacts.Count)
+            {
+                foreach (var pair in state.Deferred)
+                {
+                    state.Order[pair.Key] = state.Contacts.Count;
+                    state.Contacts.Add(pair.Value);
+                }
+                state.Deferred.Clear();
+            }
             var (start, end) = state.TakeBatch();
             for (int i = start; i < end; i++) Generate(dialog, state, state.Contacts[i]);
-            if (state.Position == state.Contacts.Count) Finish(dialog, state);
-            else
-            {
-                if (start < state.PriorityEnd && end == state.PriorityEnd)
-                    for (int i = 0; i < state.PriorityEnd; i++) Publish(dialog, state, state.Contacts[i].UserId);
-                dialog.RunInUpdates(1, state.Tick);
-            }
+            if (state.Position == state.Contacts.Count && state.Deferred.Count == 0) Pending.Remove(dialog);
         }
         catch (Exception error)
         {
-            Abort(dialog, state, error);
+            Abort(dialog, error);
         }
+        return false;
     }
 
     internal static void Generate(ContactsDialog dialog, Loading state, ContactData data)
     {
+        if (state.Deferred.Remove(data.UserId, out var latest)) data = latest;
         if (Items(dialog).ContainsKey(data.UserId)) return;
         if (!ReferenceEquals(state.Manager.GetContact(data.UserId), data.Contact)) return;
-        state.Update(data);
+        state.Creating = true;
+        try { state.Update(data); }
+        finally { state.Creating = false; }
     }
 
-    internal static void BeforeSelect(ContactsDialog __instance, string __0)
+    internal static bool BeforeSelect(ContactsDialog __instance, string __0)
     {
-        if (string.IsNullOrEmpty(__0) || !Pending.TryGetValue(__instance, out var state)) return;
+        if (string.IsNullOrEmpty(__0) || !Pending.TryGetValue(__instance, out var state)) return true;
+        if (state.Contacts == null || !__instance.Slot.IsActive)
+        {
+            state.Selection = __0;
+            return false;
+        }
         try
         {
             if (!Items(__instance).ContainsKey(__0))
             {
                 ContactData? data = null;
                 if (state.Order.TryGetValue(__0, out int index)) data = state.Contacts[index];
-                // ponytail: 事前処理中など索引にない選択だけO(N)。通常の選択には索引を使う。
+                // ponytail: 索引にない選択だけO(N)。通常の選択には索引を使う。
                 else state.Manager.ForeachContactData(candidate => { if (candidate.UserId == __0) data = candidate; });
                 if (data != null) Generate(__instance, state, data);
             }
-            Publish(__instance, state, __0);
         }
         catch (Exception error)
         {
-            Abort(__instance, state, error);
+            Abort(__instance, error);
             throw;
         }
+        return true;
+    }
+
+    internal static bool BeforeItem(ContactsDialog __instance, ContactData __0)
+    {
+        if (Pending.TryGetValue(__instance, out var state) && !state.Creating && !Items(__instance).ContainsKey(__0.UserId))
+        {
+            state.Deferred[__0.UserId] = __0;
+            SortRequested(__instance) = true;
+            return false;
+        }
+        return true;
     }
 
     private static ContactItem CreateItem(ContactsDialog dialog, ContactData data)
@@ -288,9 +308,7 @@ internal static class ContactsPatches
         if (!Pending.TryGetValue(dialog, out var state)) return AddItem(dialog);
         var ui = ListUI(dialog);
         var slot = ui.Root.AddSlot("Panel");
-        slot.ActiveSelf = ActiveFromStart;
         slot.OrderOffset = state.RowOrder(data.UserId);
-        state.Hidden[data.UserId] = slot;
         try
         {
             ui.ForceNext = slot.GetComponentOrAttach<RectTransform>();
@@ -299,7 +317,6 @@ internal static class ContactsPatches
         catch
         {
             ui.ForceNext = null!;
-            state.Hidden.Remove(data.UserId);
             slot.Destroy();
             throw;
         }
@@ -307,24 +324,13 @@ internal static class ContactsPatches
 
     private static void AfterItem(ContactsDialog __instance, ContactData __0)
     {
-        if (Pending.TryGetValue(__instance, out var state) && (ActiveFromStart || !state.Hidden.ContainsKey(__0.UserId))
+        if (Pending.TryGetValue(__instance, out _)
             && Items(__instance).TryGetValue(__0.UserId, out var item))
-            item.Slot.ActiveSelf = MatchesSearch(item.Username, item.AlternateNames, Search(__instance).Target.TargetString);
-        // ponytail: 通常イベントの生成件数は制限しない。大量発生が実測で問題なら分割処理へ合流する。
-    }
-
-    private static void AfterSearch(ContactsDialog __instance)
-    {
-        if (!ActiveFromStart && Pending.TryGetValue(__instance, out var state))
-            foreach (var slot in state.Hidden.Values)
-                if (!slot.IsDestroyed) slot.ActiveSelf = false;
-    }
-
-    private static void Publish(ContactsDialog dialog, Loading state, string id)
-    {
-        if (state.Hidden.Remove(id, out var slot) && !ActiveFromStart && !slot.IsDestroyed
-            && Items(dialog).TryGetValue(id, out var item) && item.Slot == slot)
-            slot.ActiveSelf = MatchesSearch(item.Username, item.AlternateNames, Search(dialog).Target.TargetString);
+        {
+            string query = Search(__instance).Target.TargetString;
+            if (!string.IsNullOrWhiteSpace(query))
+                item.Slot.ActiveSelf = MatchesSearch(item.Username, item.AlternateNames, query);
+        }
     }
 
     internal static bool MatchesSearch(string username, IEnumerable<string> alternateNames, string query)
@@ -337,42 +343,21 @@ internal static class ContactsPatches
         return false;
     }
 
-    internal static bool ShouldSort(ContactsDialog dialog) => SortRequested(dialog) && !Pending.TryGetValue(dialog, out _);
-
-    internal static int CompareRows(Slot a, Slot b)
+    internal static void RequestActivationSort(ContactsDialog dialog, bool requested)
     {
-        var first = a.GetComponent<ContactItem>();
-        var second = b.GetComponent<ContactItem>();
-        if (first?.Contact == null) return second?.Contact == null ? 0 : 1;
-        if (second?.Contact == null) return -1;
-        return SortKey(first.Contact, first.Data?.CurrentStatus?.OnlineStatus ?? OnlineStatus.Offline, first.HasMessages)
-            .CompareTo(SortKey(second.Contact, second.Data?.CurrentStatus?.OnlineStatus ?? OnlineStatus.Offline, second.HasMessages));
+        if (!Pending.TryGetValue(dialog, out _)) SortRequested(dialog) = requested;
     }
 
-    private static void Finish(ContactsDialog dialog, Loading state)
+    internal static void RequestItemSort(ContactsDialog dialog, bool requested)
     {
-        ListRoot(dialog).Target.SortChildren(CompareRows);
-        SortRequested(dialog) = false;
-        Release(dialog, state);
+        if (!Pending.TryGetValue(dialog, out var state) || !state.Creating) SortRequested(dialog) = requested;
     }
 
-    private static void Release(ContactsDialog dialog, Loading state)
+    private static void Abort(ContactsDialog dialog, Exception error)
     {
-        try
-        {
-            foreach (string id in state.Hidden.Keys.ToArray()) Publish(dialog, state, id);
-        }
-        finally { Pending.Remove(dialog); }
-    }
-
-    private static void Abort(ContactsDialog dialog, Loading state, Exception error)
-    {
-        try { Release(dialog, state); }
-        finally
-        {
-            SortRequested(dialog) = true;
-            ReportError?.Invoke(error);
-        }
+        Pending.Remove(dialog);
+        SortRequested(dialog) = true;
+        ReportError?.Invoke(error);
     }
 
     internal static void OnDispose(ContactsDialog __instance) => Pending.Remove(__instance);

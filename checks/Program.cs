@@ -1,5 +1,5 @@
-using System.Reflection.Emit;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using BepInEx.Configuration;
@@ -12,15 +12,15 @@ using SkyFrost.Base;
 internal static class Program
 {
     private static int assertions;
-    private static readonly Dictionary<Slot, bool> active = [];
-    private static readonly Queue<Action> scheduled = [];
     private static readonly Slot root = Empty<Slot>();
     private static readonly TextField search = Empty<TextField>();
+    private static readonly Dictionary<Slot, ContactItem> rows = [];
+    private static readonly Dictionary<Slot, bool> active = [];
+    private static readonly Dictionary<SyncRef<Text>, Text> texts = [];
+    private static readonly List<string> selections = [];
     private static string query = "";
-    private static int sorts;
+    private static bool visible = true;
     private static int activeWrites;
-    private static int writesAtSort;
-    private static ContactsPatches.Loading? observed;
 
     private static void Main(string[] args)
     {
@@ -42,13 +42,6 @@ internal static class Program
     private static void Run()
     {
         CheckSettings();
-        foreach (var status in Enum.GetValues<OnlineStatus>().Append((OnlineStatus)999))
-        {
-            Check(ContactsPatches.Priority(1, status) == 0, "未読は状態によらず最優先");
-            bool online = status is OnlineStatus.Sociable or OnlineStatus.Online or OnlineStatus.Away or OnlineStatus.Busy;
-            Check(ContactsPatches.Priority(0, status) == (online ? 1 : 2), "オンライン4状態とその他の分類");
-        }
-
         var manager = Empty<ContactManager>();
         var current = new Dictionary<string, ContactData>();
         AccessTools.Field(typeof(ContactManager), "_lock").SetValue(manager, new object());
@@ -60,115 +53,75 @@ internal static class Program
             current[id] = data;
             return data;
         }
-        var input = new List<ContactData> { Data("other1"), Data("online", OnlineStatus.Online),
-            Data("unread1"), Data("away", OnlineStatus.Away), Data("other2"), Data("unread2", OnlineStatus.Busy) };
-        int reads = 0;
-        var ordered = ContactsPatches.Prepare(input, data => { reads++; return data.UserId.StartsWith("unread") ? 1 : 0; });
-        Check(ordered.Contacts.Select(d => d.UserId).SequenceEqual(new[] { "unread2", "unread1", "online", "away", "other1", "other2" }), "優先群の中も状態順に事前整列");
-        Check(reads == 6 && ordered.PriorityEnd == 4, "未読取得は各1回、優先群の境界");
-        var recent = Data("recent");
-        recent.Contact.LatestMessageTime = new DateTime(2026, 10, 13);
-        Check(ContactsPatches.Prepare([input[0], recent], _ => 0).Contacts[0] == recent, "最新メッセージを先に整列");
-        var request = Data("request");
-        request.Contact.ContactStatus = ContactStatus.Requested;
-        Check(ContactsPatches.SortKey(request.Contact, OnlineStatus.Offline, false).Category == 2, "受信リクエストのカテゴリ");
-        var nativeCategory = AccessTools.MethodDelegate<Func<ContactItem, int>>(AccessTools.Method(typeof(ContactsDialog), "GetOrderNumber"));
-        foreach (var status in Enum.GetValues<OnlineStatus>())
-        foreach (var contact in new[] { new Contact(), new Contact { ContactStatus = ContactStatus.Requested },
-            new Contact { IsMigrated = true, IsCounterpartMigrated = false } })
-        {
-            var entry = new ContactData(manager, contact);
-            entry.CurrentStatus.OnlineStatus = status;
-            var item = Empty<ContactItem>();
-            AccessTools.PropertySetter(typeof(ContactItem), "Contact").Invoke(item, [contact]);
-            AccessTools.PropertySetter(typeof(ContactItem), "Data").Invoke(item, [entry]);
-            Check(ContactsPatches.SortKey(contact, status, false).Category == nativeCategory(item), "ソートのカテゴリが実DLLの本体と一致");
-        }
 
         foreach (int count in new[] { 0, 1, 9, 10, 11, 23, 32 })
-        foreach (int priority in Enumerable.Range(0, count + 1))
         {
-            var state = new ContactsPatches.Loading(manager, _ => { }) { Contacts = Enumerable.Repeat(input[0], count).ToList(), PriorityEnd = priority };
+            var state = new ContactsPatches.Loading(manager, _ => { }) { Contacts = Enumerable.Repeat(Data("batch"), count).ToList() };
             var visited = new List<int>();
-            int boundaries = 0;
             while (state.Position < count)
             {
                 var (start, end) = state.TakeBatch();
                 Check(end > start && end - start <= 10, "1更新最大10件、必ず進む");
-                Check(!(start < priority && end > priority), "優先群の境界をまたがない");
                 visited.AddRange(Enumerable.Range(start, end - start));
-                if (start < priority && end == priority && end < count) boundaries++;
             }
             Check(visited.SequenceEqual(Enumerable.Range(0, count)), "全件を1回ずつ走査");
-            Check(boundaries == (priority > 0 && priority < count ? 1 : 0), "優先分の公開境界は最大1回");
         }
-
-        var dialog = Empty<ContactsDialog>();
-        ContactsPatches.Items(dialog) = new();
-        var selected = Data("selected");
-        var deleted = Data("deleted");
-        var replaced = Data("replaced");
-        var normal = Data("normal");
-        var created = new List<string>();
-        var loading = new ContactsPatches.Loading(manager, data =>
-        {
-            created.Add(data.UserId);
-            ContactsPatches.Items(dialog).Add(data.UserId, Empty<ContactItem>());
-        }) { Contacts = [selected, deleted, replaced, normal], PriorityEnd = 1 };
-        ContactsPatches.Pending.Add(dialog, loading);
-        current.Remove(deleted.UserId);
-        Data(replaced.UserId);
-        ContactsPatches.BeforeSelect(dialog, selected.UserId);
-        ContactsPatches.BeforeSelect(dialog, selected.UserId);
-        foreach (var data in loading.Contacts) ContactsPatches.Generate(dialog, loading, data);
-        Check(created.SequenceEqual(new[] { "selected", "normal" }), "指定先の優先生成、重複・削除・古いContactの除外");
-        ContactsPatches.SortRequested(dialog) = true;
-        Check(!ContactsPatches.ShouldSort(dialog), "生成中の毎更新ソートを抑制");
-        ContactsPatches.OnDispose(dialog);
-        Check(!ContactsPatches.Pending.TryGetValue(dialog, out _) && ContactsPatches.ShouldSort(dialog), "Disposeで状態解放とソート抑制解除");
-        AccessTools.Method(typeof(ContactsPatches), "RunBatch").Invoke(null, [dialog, loading]);
-        Check(created.Count == 2, "破棄後の古い予約では生成しない");
-
         Check(ContactsPatches.MatchesSearch("Alice", [], " AL "), "検索の前後空白・大小文字");
         Check(ContactsPatches.MatchesSearch("Alice", ["別名"], "別"), "別名の前方一致");
         Check(!ContactsPatches.MatchesSearch("Alice", [], "lic"), "部分一致には変えない");
         Check(ContactsPatches.MatchesSearch("Alice", [], "  "), "空の検索");
 
-        foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "UpdateContactItem" })
+        foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "OnActivated", "UpdateContactItem" })
         {
             var method = AccessTools.DeclaredMethod(typeof(ContactsDialog), name);
             var original = PatchProcessor.GetOriginalInstructions(method).ToList();
-            var before = original.Select(op => (op.opcode, op.operand)).ToArray();
+            int length = original.Count;
             Func<IEnumerable<CodeInstruction>, IEnumerable<CodeInstruction>> transform = name switch {
-                "OnAttach" => ContactsPatches.TranspileAttach, "OnCommonUpdate" => ContactsPatches.TranspileSort,
-                _ => ContactsPatches.TranspileItem };
+                "OnAttach" => ContactsPatches.TranspileAttach, "UpdateContactItem" => ContactsPatches.TranspileItem,
+                _ => code => ContactsPatches.TranspileSort(code, method) };
             var changed = transform(original).ToList();
-            int added = name == "UpdateContactItem" ? 1 : 0;
-            Check(changed.Count == before.Length + added, "IL命令数の変化は必要な引数追加だけ");
-            Check(changed.Count(op => op.operand is MethodInfo methodInfo && methodInfo.DeclaringType == typeof(ContactsPatches)) == 1, "1か所だけ本Modへ差し替え");
+            Check(changed.Count == length + (name == "UpdateContactItem" ? 1 : 0), "ILの追加は必要な引数だけ");
+            Check(changed.Count(op => op.operand is MethodInfo m && m.DeclaringType == typeof(ContactsPatches))
+                == (name == "UpdateContactItem" ? 2 : 1), "生成とソート要求の必要箇所だけ差し替え");
             Reject(() => transform([]).ToList());
             var doubled = PatchProcessor.GetOriginalInstructions(method).ToList();
             Reject(() => transform(doubled.Concat(doubled)).ToList());
         }
-
         var create = PatchProcessor.GetOriginalInstructions(AccessTools.Method(typeof(ContactsPatches), "CreateItem")).ToList();
-        int setActive = create.FindIndex(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf")));
         int setOrder = create.FindIndex(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "OrderOffset")));
         int attachRect = create.FindIndex(op => op.operand is MethodInfo m && m.Name == "GetComponentOrAttach" && m.GetGenericArguments().Contains(typeof(RectTransform)));
-        Check(setActive > 0 && create[setActive - 1].opcode == OpCodes.Ldsfld
-            && Equals(create[setActive - 1].operand, AccessTools.Field(typeof(ContactsPatches), nameof(ContactsPatches.ActiveFromStart)))
-            && setActive < attachRect && setOrder < attachRect, "RectTransform取り付け前に表示モードと順序を設定");
-        var finish = PatchProcessor.GetOriginalInstructions(AccessTools.Method(typeof(ContactsPatches), "Finish")).ToList();
-        Check(finish.FindIndex(op => op.Calls(AccessTools.Method(typeof(Slot), "SortChildren")))
-            < finish.FindIndex(op => op.Calls(AccessTools.Method(typeof(ContactsPatches), "Release"))), "最終ソートが公開より先");
+        Check(setOrder >= 0 && setOrder < attachRect, "RectTransformより先にOrderOffsetを設定");
+        Check(!create.Any(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf"))), "新規Slotの既定Active ONをそのまま使う");
+        Check(!typeof(ContactsPatches).GetMethods(BindingFlags.Static | BindingFlags.NonPublic)
+            .SelectMany(method => PatchProcessor.GetOriginalInstructions(method))
+            .Any(op => op.operand is MethodInfo m && m.Name is "SortChildren" or "RunInUpdates"), "全体ソートと更新予約を持たない");
 
-        CheckPublication(manager, Data);
+        var boundary = new Harmony("SmoothContacts.Checks.Boundary");
+        void Patch(MethodInfo target, string prefix) => boundary.Patch(target, prefix: new HarmonyMethod(typeof(Program), prefix));
+        try
+        {
+            Patch(AccessTools.PropertyGetter(typeof(Slot), "IsActive"), nameof(IsActive));
+            Patch(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf"), nameof(SetActive));
+            Patch(AccessTools.PropertyGetter(typeof(SyncRef<Text>), "Target"), nameof(GetText));
+            Patch(AccessTools.PropertyGetter(typeof(TextField), "TargetString"), nameof(GetQuery));
+            var getItem = typeof(ContainerWorker<Component>).GetMethods(BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly)
+                .Single(m => m.Name == "GetComponent" && m.IsGenericMethodDefinition)
+                .MakeGenericMethod(typeof(ContactItem));
+            Patch(getItem, nameof(GetItem));
+            Patch(AccessTools.DeclaredMethod(typeof(ContactsDialog), "OpenContactPage"), nameof(OpenPage));
+            CheckNativeOrder(manager, Data);
+            // 参照型のジェネリックgetterは実行コードを共有するため、検査の段階ごとに置換する。
+            boundary.Unpatch(AccessTools.PropertyGetter(typeof(SyncRef<Text>), "Target"), HarmonyPatchType.All, boundary.Id);
+            Patch(AccessTools.PropertyGetter(typeof(SyncRef<TextField>), "Target"), nameof(GetSearch));
+            CheckLoading(manager, current, Data);
+        }
+        finally { boundary.UnpatchSelf(); ContactsPatches.ReportError = null; }
 
         var harmony = new Harmony("SmoothContacts.Checks");
         try
         {
             ContactsPatches.Apply(harmony);
-            foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "UpdateContactItem", "SearchTextChanged", "OpenContactPage", "set_SelectedContactId", "OnDispose" })
+            foreach (string name in new[] { "OnAttach", "OnCommonUpdate", "OnActivated", "UpdateContactItem", "OpenContactPage", "set_SelectedContactId", "OnDispose" })
                 Check(Harmony.GetPatchInfo(AccessTools.DeclaredMethod(typeof(ContactsDialog), name))?.Owners.Contains(harmony.Id) == true,
                     $"実DLLへのパッチ適用: {name}");
         }
@@ -185,7 +138,7 @@ internal static class Program
             ContactsPatches.BindSettings(config);
             Check(config.Count == 1 && ContactsPatches.BatchSize.Value == 10, "設定は件数だけ、初期値10");
             var state = new ContactsPatches.Loading(Empty<ContactManager>(), _ => { }) {
-                Contacts = Enumerable.Repeat<ContactData>(null!, 100).ToList(), PriorityEnd = 20 };
+                Contacts = Enumerable.Repeat<ContactData>(null!, 100).ToList() };
             Check(state.TakeBatch() == (0, 10), "初期値で10件ずつ進む");
             ContactsPatches.BatchSize.Value = 3;
             Check(state.TakeBatch() == (10, 13), "途中変更を次のバッチへ反映");
@@ -199,128 +152,165 @@ internal static class Program
                 Check(end == start + 1, "0以下でも1件ずつ進む");
             }
             ContactsPatches.BatchSize.Value = int.MaxValue;
-            Check(state.TakeBatch() == (16, 20), "大きな件数でも優先群の境界で止まる");
-            Check(state.TakeBatch() == (20, 100), "残りにも同じ設定を適用し、件数を超えない");
+            Check(state.TakeBatch() == (16, 100), "大きな件数でも全件数を超えない");
             Check(state.TakeBatch() == (100, 100), "完了後は進まない");
         }
-        finally
-        {
-            File.Delete(path);
-            ContactsPatches.BatchSize.Value = 10;
-        }
+        finally { File.Delete(path); ContactsPatches.BatchSize.Value = 10; }
     }
 
-    private static void CheckPublication(ContactManager manager, Func<string, OnlineStatus, ContactData> data)
+    private static void CheckNativeOrder(ContactManager manager, Func<string, OnlineStatus, ContactData> data)
     {
-        // エンジンを起動せず、表示値の書込み・予約・ソートの境界だけを検査プロセス内で置換する。
-        var harmony = new Harmony("SmoothContacts.Checks.Display");
-        void Patch(MethodInfo target, string prefix) => harmony.Patch(target, prefix: new HarmonyMethod(typeof(Program), prefix));
-        try
+        var input = new List<ContactData>();
+        foreach (var status in Enum.GetValues<OnlineStatus>().Append((OnlineStatus)999))
+        foreach (int category in new[] { 0, 1, 2 })
         {
-            ContactsPatches.ReportError = error => throw new InvalidOperationException("公開処理の検査中に例外", error);
-            Patch(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf"), nameof(SetActive));
-            Patch(AccessTools.PropertyGetter(typeof(SyncRef<Slot>), "Target"), nameof(GetRoot));
-            Patch(AccessTools.PropertyGetter(typeof(SyncRef<TextField>), "Target"), nameof(GetSearch));
-            Patch(AccessTools.PropertyGetter(typeof(TextField), "TargetString"), nameof(GetQuery));
-            Patch(AccessTools.Method(typeof(Slot), "SortChildren"), nameof(Sort));
-            Patch(AccessTools.DeclaredMethod(typeof(ComponentBase<Component>), "RunInUpdates", [typeof(int), typeof(Action)]), nameof(Schedule));
-            var dialog = Empty<ContactsDialog>();
-            ContactsPatches.Items(dialog) = [];
-            AccessTools.Field(typeof(ContactsDialog), "_listRoot").SetValue(dialog, new SyncRef<Slot>());
-            AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
-            var state = new ContactsPatches.Loading(manager, contact =>
-            {
-                var slot = Empty<Slot>();
-                var item = Empty<ContactItem>();
-                AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(item, [slot]);
-                var username = new Sync<string>();
-                AccessTools.Field(typeof(SyncField<string>), "_value").SetValue(username, contact.UserId);
-                AccessTools.Field(typeof(ContactItem), "_rawUsername").SetValue(item, username);
-                AccessTools.Field(typeof(ContactItem), "_alternateNames").SetValue(item, new SyncFieldList<string>());
-                ContactsPatches.Items(dialog)[contact.UserId] = item;
-                observed!.Hidden[contact.UserId] = slot;
-                active[slot] = ContactsPatches.ActiveFromStart;
-                AccessTools.Method(typeof(ContactsPatches), "AfterItem").Invoke(null, [dialog, contact]);
-            });
-            observed = state;
-            state.Contacts = Enumerable.Range(0, 35).Select(i => data($"row{i:D2}", OnlineStatus.Online)).ToList();
-            state.PriorityEnd = 13;
-            state.Tick = () => AccessTools.Method(typeof(ContactsPatches), "RunBatch").Invoke(null, [dialog, state]);
-            ContactsPatches.Pending.Add(dialog, state);
-            ContactsPatches.SortRequested(dialog) = true;
-            state.Tick();
-            Check(active.Count == 10 && active.Values.All(v => v == ContactsPatches.ActiveFromStart) && sorts == 0,
-                "優先分の途中も指定した表示モードで生成");
-            scheduled.Dequeue()();
-            Check(active.Count == 13 && active.Values.All(v => v) && sorts == 0, "優先分完成時は表示済み、ソートなし");
-            scheduled.Dequeue()();
-            Check(active.Count == 23 && active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 23 : 13),
-                "残りも指定した表示モードで追加");
-            foreach (var slot in active.Keys.ToArray()) active[slot] = true;
-            AccessTools.Method(typeof(ContactsPatches), "AfterSearch").Invoke(null, [dialog]);
-            Check(active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 23 : 13), "検索で一括非表示にしない");
-            ContactsPatches.BeforeSelect(dialog, "row30");
-            Check(active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 24 : 14), "未生成の選択先を先行生成");
-            query = "row2";
-            foreach (var item in ContactsPatches.Items(dialog).Values)
-                active[item.Slot] = ContactsPatches.MatchesSearch(item.Username, item.AlternateNames, query);
-            AccessTools.Method(typeof(ContactsPatches), "AfterSearch").Invoke(null, [dialog]);
-            Check(active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 3 : 0), "途中検索は現在の表示条件に従う");
-            while (scheduled.TryDequeue(out var tick)) tick();
-            Check(active.Count == 35 && sorts == 1 && !ContactsPatches.Pending.TryGetValue(dialog, out _), "全件生成後に1回だけソートして解放");
-            Check(state.Hidden.Count == 0 && active.Values.Count(v => v) == 10, "追加行にも現在の検索条件を反映");
-            Check(!ContactsPatches.ActiveFromStart || activeWrites == writesAtSort, "検証版は最終ソート後にActiveを書き込まない");
-            Check(!ContactsPatches.SortRequested(dialog), "最終ソート直後の重複ソートを要求しない");
-
-            foreach (var (count, priority) in new[] { (0, 0), (5, 5), (11, 0) })
-            {
-                active.Clear();
-                ContactsPatches.Items(dialog).Clear();
-                query = "";
-                int previousSorts = sorts;
-                var stage = new ContactsPatches.Loading(manager, state.Update) {
-                    Contacts = Enumerable.Range(0, count).Select(i => data($"edge{i}", OnlineStatus.Offline)).ToList(), PriorityEnd = priority };
-                observed = stage;
-                stage.Tick = () => AccessTools.Method(typeof(ContactsPatches), "RunBatch").Invoke(null, [dialog, stage]);
-                ContactsPatches.Pending.Add(dialog, stage);
-                stage.Tick();
-                while (scheduled.TryDequeue(out var tick)) tick();
-                Check(active.Count == count && active.Values.All(v => v) && sorts == previousSorts + 1
-                    && !ContactsPatches.Pending.TryGetValue(dialog, out _), "空・優先分のみ・残りのみでも公開と終了");
-            }
-
-            Exception? reported = null;
-            ContactsPatches.ReportError = error => reported = error;
-            var failure = new InvalidOperationException("検査用");
-            var failed = new ContactsPatches.Loading(manager, _ => throw failure) { Contacts = [data("failure", OnlineStatus.Offline)] };
-            ContactsPatches.Pending.Add(dialog, failed);
-            AccessTools.Method(typeof(ContactsPatches), "RunBatch").Invoke(null, [dialog, failed]);
-            Check(ReferenceEquals(reported, failure) && !ContactsPatches.Pending.TryGetValue(dialog, out _), "生成例外で記録と解放");
+            var entry = data($"order{input.Count:D2}", status);
+            entry.Contact.LatestMessageTime = new DateTime(2026, 10, 13).AddHours(input.Count % 3);
+            entry.Contact.ContactUsername = input.Count % 2 == 0 ? "Alice" : "Bob";
+            if (category == 1) entry.Contact.ContactStatus = ContactStatus.Requested;
+            if (category == 2) { entry.Contact.IsMigrated = true; entry.Contact.IsCounterpartMigrated = false; }
+            input.Add(entry);
         }
-        finally { harmony.UnpatchSelf(); ContactsPatches.ReportError = null; observed = null; }
+        input.Reverse();
+        var unread = input.Select((entry, index) => (entry.UserId, Count: index % 2)).ToDictionary(p => p.UserId, p => p.Count);
+        var slots = input.Select(entry => Item(entry, unread[entry.UserId] > 0).Slot).ToList();
+        var slotsById = slots.ToDictionary(slot => rows[slot].Data.UserId);
+        var native = PatchProcessor.GetOriginalInstructions(AccessTools.DeclaredMethod(typeof(ContactsDialog), "OnCommonUpdate"))
+            .Where(op => op.opcode == OpCodes.Ldftn).Select(op => op.operand).OfType<MethodInfo>()
+            .Single(m => m.ReturnType == typeof(int) && m.GetParameters().Select(p => p.ParameterType).SequenceEqual(new[] { typeof(Slot), typeof(Slot) }));
+        var compare = native.CreateDelegate<Comparison<Slot>>(native.IsStatic ? null : RuntimeHelpers.GetUninitializedObject(native.DeclaringType!));
+        slots.Sort(compare);
+        int reads = 0;
+        var prepared = ContactsPatches.Prepare(input, entry => { reads++; return unread[entry.UserId]; });
+        Check(prepared.Contacts.Select((entry, index) => compare(slots[index], slotsById[entry.UserId]) == 0).All(v => v),
+            "未読・全状態・受信リクエスト・移行未完了・日時・名前の順が実DLLの比較と一致");
+        Check(reads == input.Count, "未読数は各1回だけ取得");
+        Check(prepared.Contacts.Select((entry, index) => prepared.Order[entry.UserId] == index).All(v => v), "順位の索引が事前順と一致");
+        var request = data("request", OnlineStatus.Offline);
+        request.Contact.ContactStatus = ContactStatus.Requested;
+        var away = data("away", OnlineStatus.Away);
+        Check(ContactsPatches.Prepare([away, request], _ => 0).Contacts[0] == request, "独自のオンライン優先群を撤去し、受信リクエストをAwayより先にする");
+        rows.Clear(); active.Clear(); texts.Clear();
     }
 
+    private static void CheckLoading(ContactManager manager, Dictionary<string, ContactData> current, Func<string, OnlineStatus, ContactData> data)
+    {
+        var dialog = Empty<ContactsDialog>();
+        AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(dialog, [root]);
+        AccessTools.Field(typeof(ContactsDialog), "_searchBar").SetValue(dialog, new SyncRef<TextField>());
+        ContactsPatches.Items(dialog) = [];
+        ContactsPatches.ReportError = error => throw new InvalidOperationException("生成検査中の例外", error);
+        var created = new List<string>();
+        void Update(ContactData entry)
+        {
+            Check(ContactsPatches.BeforeItem(dialog, entry), "分割生成からの更新は本体へ通す");
+            var item = Item(entry);
+            ContactsPatches.Items(dialog)[entry.UserId] = item;
+            created.Add(entry.UserId);
+            if (entry.UserId == "nested") ContactsPatches.SortRequested(dialog) = true;
+            ContactsPatches.RequestItemSort(dialog, true);
+            AccessTools.Method(typeof(ContactsPatches), "AfterItem").Invoke(null, [dialog, entry]);
+        }
+        var state = new ContactsPatches.Loading(manager, Update);
+        ContactsPatches.Pending.Add(dialog, state);
+        Check(!ContactsPatches.UpdateLoading(dialog) && created.Count == 0, "事前処理中は生成しない");
+        Check(!ContactsPatches.BeforeSelect(dialog, "row30") && state.Selection == "row30", "事前処理中の選択を保持");
+        state.Selection = null;
+        (state.Contacts, state.Order) = ContactsPatches.Prepare(Enumerable.Range(0, 35).Select(i => data($"row{i:D2}", OnlineStatus.Offline)).ToList(), _ => 0);
+        ContactsPatches.SortRequested(dialog) = false;
+        Check(!ContactsPatches.UpdateLoading(dialog) && created.Count == 10 && active.Values.All(v => v), "10件ずつ最初から表示");
+        Check(!ContactsPatches.SortRequested(dialog) && activeWrites == 0, "初期生成のソート要求を除き、空の検索ではActiveを書き直さない");
+        visible = false;
+        ContactsPatches.RequestActivationSort(dialog, true);
+        Check(!ContactsPatches.SortRequested(dialog), "生成中の再表示ソート要求を除く");
+        for (int i = 0; i < 3; i++) Check(!ContactsPatches.UpdateLoading(dialog) && created.Count == 10 && state.Position == 10, "親が非アクティブなら位置を進めず生成しない");
+        Check(!ContactsPatches.BeforeSelect(dialog, "row30"), "非アクティブ中の選択を保留");
+        visible = true;
+        query = "row2";
+        foreach (var item in ContactsPatches.Items(dialog).Values) active[item.Slot] = ContactsPatches.MatchesSearch(item.Username, item.AlternateNames, query);
+        ContactsPatches.UpdateLoading(dialog);
+        Check(created.Count == 21 && selections.SequenceEqual(new[] { "row30" }) && state.Selection == null, "再表示で選択先1件と続き10件を生成");
+        Check(!active[ContactsPatches.Items(dialog)["row30"].Slot], "選択先にも途中の検索条件を適用");
+        while (ContactsPatches.Pending.TryGetValue(dialog, out _)) Check(!ContactsPatches.UpdateLoading(dialog), "完成した更新でも本体ソートを呼ばない");
+        Check(created.Count == 35 && created.Distinct().Count() == 35 && active.Values.Count(v => v) == 10, "全件表示・重複なし・途中検索");
+        Check(!ContactsPatches.UpdateLoading(dialog), "初期生成だけなら完成後もソート要求なし");
+        ContactsPatches.RequestActivationSort(dialog, true);
+        Check(ContactsPatches.UpdateLoading(dialog), "完成後の通常の再表示ソートは本体へ戻す");
+
+        ContactsPatches.Items(dialog).Clear(); rows.Clear(); active.Clear(); texts.Clear(); created.Clear(); query = "";
+        var deleted = data("deleted", OnlineStatus.Offline);
+        var replaced = data("replaced", OnlineStatus.Offline);
+        var normal = data("normal", OnlineStatus.Offline);
+        var existing = data("existing", OnlineStatus.Offline);
+        (var contacts, var order) = ContactsPatches.Prepare([deleted, replaced, normal, existing], _ => 0);
+        var events = new ContactsPatches.Loading(manager, Update) { Contacts = contacts, Order = order };
+        ContactsPatches.Pending.Add(dialog, events);
+        ContactsPatches.Items(dialog)[existing.UserId] = Item(existing);
+        current.Remove(deleted.UserId);
+        data("replaced", OnlineStatus.Online);
+        var extra = data("extra", OnlineStatus.Offline);
+        Check(!ContactsPatches.BeforeItem(dialog, extra), "通常イベントの未生成行をキューへ合流");
+        var latest = data("extra", OnlineStatus.Busy);
+        Check(!ContactsPatches.BeforeItem(dialog, latest) && events.Deferred.Count == 1 && events.Deferred["extra"] == latest, "同じ相手の保留は最新データ1件だけ");
+        Check(ContactsPatches.BeforeItem(dialog, existing), "既存行の通常更新は本体へ通す");
+        while (ContactsPatches.Pending.TryGetValue(dialog, out _)) ContactsPatches.UpdateLoading(dialog);
+        Check(created.SequenceEqual(new[] { "normal", "extra" }), "削除と旧データを除き、既存行を重複せず追加の相手も生成");
+        Check(ContactsPatches.Items(dialog)["extra"].Data == latest && ContactsPatches.UpdateLoading(dialog), "最新データと通常イベントのソート要求を維持");
+
+        ContactsPatches.SortRequested(dialog) = false;
+        var nested = new ContactsPatches.Loading(manager, Update) { Contacts = [data("nested", OnlineStatus.Offline)] };
+        ContactsPatches.Pending.Add(dialog, nested);
+        ContactsPatches.UpdateLoading(dialog);
+        Check(ContactsPatches.SortRequested(dialog), "生成コールバック内の別イベントのソート要求も取り消さない");
+
+        var disposed = new ContactsPatches.Loading(manager, Update) { Contacts = [normal] };
+        ContactsPatches.Pending.Add(dialog, disposed);
+        ContactsPatches.OnDispose(dialog);
+        Check(!ContactsPatches.Pending.TryGetValue(dialog, out _) && ContactsPatches.UpdateLoading(dialog), "Disposeで初期生成状態を解放");
+        var empty = new ContactsPatches.Loading(manager, Update) { Contacts = [] };
+        ContactsPatches.Pending.Add(dialog, empty);
+        Check(!ContactsPatches.UpdateLoading(dialog) && !ContactsPatches.Pending.TryGetValue(dialog, out _), "0件でも終了");
+        Exception? reported = null;
+        ContactsPatches.ReportError = error => reported = error;
+        var failure = new InvalidOperationException("検査用");
+        var failed = new ContactsPatches.Loading(manager, _ => throw failure) { Contacts = [data("failure", OnlineStatus.Offline)] };
+        ContactsPatches.Pending.Add(dialog, failed);
+        ContactsPatches.UpdateLoading(dialog);
+        Check(ReferenceEquals(reported, failure) && !failed.Creating && !ContactsPatches.Pending.TryGetValue(dialog, out _) && ContactsPatches.SortRequested(dialog), "例外で記録・状態解放・本体ソートへ復帰");
+    }
+
+    private static ContactItem Item(ContactData data, bool unread = false)
+    {
+        var slot = Empty<Slot>();
+        var item = Empty<ContactItem>();
+        AccessTools.PropertySetter(typeof(Component), "Slot").Invoke(item, [slot]);
+        AccessTools.PropertySetter(typeof(ContactItem), "Contact").Invoke(item, [data.Contact]);
+        AccessTools.PropertySetter(typeof(ContactItem), "Data").Invoke(item, [data]);
+        var username = new Sync<string>();
+        AccessTools.Field(typeof(SyncField<string>), "_value").SetValue(username, data.Contact.ContactUsername);
+        AccessTools.Field(typeof(ContactItem), "_rawUsername").SetValue(item, username);
+        AccessTools.Field(typeof(ContactItem), "_alternateNames").SetValue(item, new SyncFieldList<string>());
+        var unreadRef = new SyncRef<Text>();
+        var unreadText = Empty<Text>();
+        var content = new Sync<string>();
+        AccessTools.Field(typeof(SyncField<string>), "_value").SetValue(content, unread ? "1" : "");
+        AccessTools.Field(typeof(Text), "Content").SetValue(unreadText, content);
+        AccessTools.Field(typeof(ContactItem), "_unreadCount").SetValue(item, unreadRef);
+        texts[unreadRef] = unreadText;
+        rows[slot] = item;
+        active[slot] = true;
+        return item;
+    }
+
+    private static bool IsActive(ref bool __result) { __result = visible; return false; }
     private static bool SetActive(Slot __instance, bool __0) { activeWrites++; active[__instance] = __0; return false; }
-    private static bool GetRoot(ref Slot __result) { __result = root; return false; }
     private static bool GetSearch(ref TextField __result) { __result = search; return false; }
+    private static bool GetText(SyncRef<Text> __instance, ref Text __result) { __result = texts[__instance]; return false; }
     private static bool GetQuery(ref string __result) { __result = query; return false; }
-    private static bool Schedule(int __0, Action __1) { Check(__0 == 1, "次の更新へ予約"); scheduled.Enqueue(__1); return false; }
-    private static bool Sort()
-    {
-        Check(ContactsPatches.ActiveFromStart || observed!.Hidden.Values.All(slot => !active[slot]), "最終ソート時の表示状態");
-        writesAtSort = activeWrites;
-        sorts++;
-        return false;
-    }
-
+    private static bool GetItem(Slot __instance, ref ContactItem __result) { __result = rows[__instance]; return false; }
+    private static bool OpenPage(ContactsDialog __instance, string __0) { selections.Add(__0); Check(ContactsPatches.BeforeSelect(__instance, __0), "再開時の選択は本体へ通す"); return false; }
     private static T Empty<T>() where T : class => (T)RuntimeHelpers.GetUninitializedObject(typeof(T));
-
-    private static void Check(bool condition, string message)
-    {
-        if (!condition) throw new InvalidOperationException(message);
-        assertions++;
-    }
-
+    private static void Check(bool condition, string message) { if (!condition) throw new InvalidOperationException(message); assertions++; }
     private static void Reject(Action action)
     {
         try { action(); }

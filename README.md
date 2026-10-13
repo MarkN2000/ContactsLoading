@@ -6,8 +6,6 @@ A [Resonite](https://resonite.com/) mod that reduces freezing when opening the C
 
 Adjust how many contacts are generated per update in Bepis Mod Settings. Default: **10**.
 
-Currently in development. No release is available yet.
-
 ## License
 
 [MIT](https://github.com/MarkN2000/SmoothContacts/blob/main/LICENSE) © 2026 markn2000

@@ -2,9 +2,9 @@
 
 ![SmoothContacts](https://raw.githubusercontent.com/MarkN2000/SmoothContacts/main/icon.png)
 
-A [Resonite](https://resonite.com/) mod that reduces freezing when opening or searching the Contacts tab.
+A [Resonite](https://resonite.com/) mod that reduces freezing when opening Contacts or clearing a search.
 
-Adjust how many contacts are generated or filtered per update in Bepis Mod Settings. Default: **10**.
+Adjust how many contacts are generated or restored per update in Bepis Mod Settings. Default: **10**.
 
 ## License
 

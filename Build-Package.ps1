@@ -21,7 +21,7 @@ $manifest = [ordered]@{
     name = 'SmoothContacts'
     author = 'markn2000'
     version_number = $version
-    description = 'Reduces freezing when opening or searching the Contacts tab.'
+    description = 'Reduces freezing when opening Contacts or clearing a search.'
     website_url = 'https://github.com/MarkN2000/SmoothContacts'
     dependencies = $dependencies
 } | ConvertTo-Json

@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.4", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.5", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -33,7 +33,7 @@ public sealed class Plugin : BasePlugin
             if (!File.Exists(Config.ConfigFilePath)) Config.Save();
             ContactsPatches.ReportError = error => Log.LogError($"Contactsの分割処理でエラー: {error}");
             ContactsPatches.Apply(HarmonyInstance);
-            Log.LogInfo("SmoothContacts: アクティブ中だけ、生成と検索の表示切り替えを分割します。");
+            Log.LogInfo("SmoothContacts: アクティブ中だけ、生成と検索解除の再表示を分割します。");
         }
         catch (Exception error)
         {
@@ -50,10 +50,10 @@ internal static class ContactsPatches
 {
     internal static ConfigEntry<int> BatchSize = null!;
     internal static void BindSettings(ConfigFile config) => BatchSize = config.Bind("生成", "1更新あたりの件数", 10,
-        "1更新で生成または検索の表示切り替えを行う合計件数。次の更新から反映します。1以上を指定してください（0以下は1として扱います）。");
+        "1更新で生成または検索解除の再表示を行う合計件数。通常の検索は即時反映します。次の更新から反映します。1以上を指定してください（0以下は1として扱います）。");
     internal static Action<Exception>? ReportError;
     internal static readonly ConditionalWeakTable<ContactsDialog, Loading> Pending = new();
-    internal static readonly ConditionalWeakTable<ContactsDialog, PriorityQueue<ContactItem, long>> Filtering = new();
+    internal static readonly ConditionalWeakTable<ContactsDialog, PriorityQueue<ContactItem, long>> Restoring = new();
     internal static readonly AccessTools.FieldRef<ContactsDialog, Dictionary<string, ContactItem>> Items =
         AccessTools.FieldRefAccess<ContactsDialog, Dictionary<string, ContactItem>>("_contactItems");
     internal static readonly AccessTools.FieldRef<ContactsDialog, bool> SortRequested =
@@ -152,17 +152,13 @@ internal static class ContactsPatches
         var target = AccessTools.PropertySetter(typeof(Slot), nameof(Slot.ActiveSelf));
         var matches = code.Select((op, i) => (op, i)).Where(p => p.op.Calls(target)).ToArray();
         if (matches.Length != 2) throw new InvalidOperationException("検索の表示切替箇所が変わっています。");
-        foreach (var (call, index) in matches.Reverse())
-        {
-            var dialog = new CodeInstruction(OpCodes.Ldarg_0);
-            dialog.labels.AddRange(call.labels);
-            dialog.blocks.AddRange(call.blocks);
-            call.labels.Clear();
-            call.blocks.Clear();
-            call.opcode = OpCodes.Call;
-            call.operand = AccessTools.Method(typeof(ContactsPatches), nameof(QueueSearch));
-            code.Insert(index, dialog);
-        }
+        var (call, index) = matches[0];
+        if (index == 0 || code[index - 1].opcode != OpCodes.Ldc_I4_1)
+            throw new InvalidOperationException("検索解除のON指定が変わっています。");
+        // 空欄の分岐だけ、trueの代わりにdialogを渡す。検索の一致判定側は本体のまま。
+        code[index - 1].opcode = OpCodes.Ldarg_0;
+        call.opcode = OpCodes.Call;
+        call.operand = AccessTools.Method(typeof(ContactsPatches), nameof(QueueRestore));
         return code;
     }
 
@@ -247,34 +243,32 @@ internal static class ContactsPatches
         }
     }
 
-    // Activeの判定は本体に任せ、検索の表示変更と生成で件数制限を共有する。
+    // Activeの判定は本体に任せ、検索解除の再表示と生成で件数制限を共有する。
     internal static bool UpdateLoading(ContactsDialog dialog)
     {
         bool loading = Pending.TryGetValue(dialog, out var state);
-        bool filtering = Filtering.TryGetValue(dialog, out var changes);
-        if (!loading && !filtering) return SortRequested(dialog);
-        if (!filtering && state?.Contacts == null) return false;
+        bool restoring = Restoring.TryGetValue(dialog, out var changes);
+        if (!loading && !restoring) return SortRequested(dialog);
+        if (!restoring && state?.Contacts == null) return false;
         int remaining = Math.Max(1, BatchSize.Value);
-        string term = NormalizeQuery(Search(dialog).Target.TargetString);
-        if (filtering)
+        if (restoring)
         {
             while (remaining > 0 && changes!.TryDequeue(out var item, out _))
             {
                 remaining--;
                 try
                 {
-                    if (item.IsRemoved) continue;
-                    bool active = MatchesSearch(item.Username, item.AlternateNames, term);
-                    if (item.Slot.ActiveSelf != active) item.Slot.ActiveSelf = active;
+                    if (!item.IsRemoved && !item.Slot.ActiveSelf) item.Slot.ActiveSelf = true;
                 }
                 catch (Exception error) { ReportError?.Invoke(error); }
             }
-            if (changes!.Count == 0) Filtering.Remove(dialog);
+            if (changes!.Count == 0) Restoring.Remove(dialog);
         }
         if (!loading) return SortRequested(dialog);
         if (state!.Contacts == null) return false;
         try
         {
+            string term = NormalizeQuery(Search(dialog).Target.TargetString);
             if (state.Selection is { } selected)
             {
                 state.Selection = null;
@@ -372,12 +366,12 @@ internal static class ContactsPatches
         }
     }
 
-    internal static void BeforeSearch(ContactsDialog __instance) => Filtering.Remove(__instance);
+    internal static void BeforeSearch(ContactsDialog __instance) => Restoring.Remove(__instance);
 
-    internal static void QueueSearch(Slot slot, bool active, ContactsDialog dialog)
+    internal static void QueueRestore(Slot slot, ContactsDialog dialog)
     {
-        if (slot.ActiveSelf != active)
-            Filtering.GetValue(dialog, _ => new()).Enqueue(slot.GetComponent<ContactItem>(), slot.OrderOffset);
+        if (!slot.ActiveSelf)
+            Restoring.GetValue(dialog, _ => new()).Enqueue(slot.GetComponent<ContactItem>(), slot.OrderOffset);
     }
 
     internal static string NormalizeQuery(string? query) => query?.Trim().ToLower() ?? "";
@@ -411,6 +405,6 @@ internal static class ContactsPatches
     internal static void OnDispose(ContactsDialog __instance)
     {
         Pending.Remove(__instance);
-        Filtering.Remove(__instance);
+        Restoring.Remove(__instance);
     }
 }

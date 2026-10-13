@@ -177,6 +177,8 @@ internal static class Program
             ContactsPatches.BindSettings(config);
             Check(config.Count == 2 && ContactsPatches.BatchSize.Value == 5 && ContactsPatches.PauseUpdates.Value == 1,
                 "設定の既定値は5件・1更新休止");
+            Check(config.Keys.All(key => key.Section == "Loading") && config.Keys.Select(key => key.Key)
+                .Order().SequenceEqual(new[] { "Batch size", "Updates to skip" }), "設定UIには英語の2項目だけ登録");
             var state = new ContactsPatches.Loading(Empty<ContactManager>(), _ => { }) {
                 Contacts = Enumerable.Repeat<ContactData>(null!, 100).ToList() };
             Check(state.TakeBatch(10) == (0, 10), "予算10件で進む");
@@ -193,6 +195,19 @@ internal static class Program
             ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
             Check(ContactsPatches.BatchSize.Value == 10 && ContactsPatches.PauseUpdates.Value == 1,
                 "旧設定の件数を保持し、新しい休止設定には既定値を使う");
+            Check((int)ContactsPatches.BatchSize.DefaultValue == 5 && (int)ContactsPatches.PauseUpdates.DefaultValue == 1,
+                "移行した保存値をリセット先の既定値にしない");
+            Check(!File.ReadAllText(path).Contains("生成") && File.ReadAllText(path).Contains("Batch size = 10"),
+                "移行を保存して日本語キーを設定ファイルから除去");
+            File.WriteAllText(path, "[生成]\n1更新あたりの件数 = 3\n処理間に休む更新回数 = 2\n");
+            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
+            Check(ContactsPatches.BatchSize.Value == 3 && ContactsPatches.PauseUpdates.Value == 2, "両方の旧設定を移行");
+            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
+            Check(ContactsPatches.BatchSize.Value == 3 && ContactsPatches.PauseUpdates.Value == 2, "移行後の再読込でも値を保持");
+            File.WriteAllText(path, "[生成]\n1更新あたりの件数 = 10\n処理間に休む更新回数 = 2\n[Loading]\nBatch size = 4\nUpdates to skip = 0\n");
+            ContactsPatches.BindSettings(new ConfigFile(path, false) { SaveOnConfigSet = false });
+            Check(ContactsPatches.BatchSize.Value == 4 && ContactsPatches.PauseUpdates.Value == 0,
+                "新旧キーの併存時は英語側を優先し、0も保持");
         }
         finally { File.Delete(path); ContactsPatches.BatchSize.Value = 10; ContactsPatches.PauseUpdates.Value = 0; }
     }

@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.9", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.10", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -31,14 +31,14 @@ public sealed class Plugin : BasePlugin
         {
             ContactsPatches.BindSettings(Config);
             if (!File.Exists(Config.ConfigFilePath)) Config.Save();
-            ContactsPatches.ReportError = error => Log.LogError($"Contactsの分割処理でエラー: {error}");
+            ContactsPatches.ReportError = error => Log.LogError($"Error while processing Contacts: {error}");
             ContactsPatches.Apply(HarmonyInstance);
-            Log.LogInfo("SmoothContacts: アクティブ中だけ、生成と検索解除の再表示を分割します。");
+            Log.LogInfo("SmoothContacts: Contact loading and search restoration are batched while Contacts is active.");
         }
         catch (Exception error)
         {
             HarmonyInstance.UnpatchSelf();
-            Log.LogError($"SmoothContactsを適用できませんでした。本Modのパッチを解除しました: {error}");
+            Log.LogError($"Failed to apply SmoothContacts. Its patches have been removed: {error}");
         }
     }
 
@@ -52,10 +52,25 @@ internal static class ContactsPatches
     internal static ConfigEntry<int> PauseUpdates = null!;
     internal static void BindSettings(ConfigFile config)
     {
-        BatchSize = config.Bind("生成", "1更新あたりの件数", 5,
-            "1更新で生成または検索解除の再表示を行う合計件数。通常の検索は即時反映します。次の処理から反映します。0以下は1として扱います。");
-        PauseUpdates = config.Bind("生成", "処理間に休む更新回数", 1,
-            "生成・検索解除の分割処理の間に休む通常更新の回数。0以下は毎更新処理します。再起動不要。減らすと残り待機も短縮し、増やすと次の処理後から反映します。");
+        // 標準の読込で旧キーを移行する。新キーの値と本来の既定値はそれぞれ保持する。
+        var saved = new Dictionary<string, string?>();
+        bool migrated = false;
+        foreach (var (name, oldName) in new[] { ("Batch size", "1更新あたりの件数"), ("Updates to skip", "処理間に休む更新回数") })
+        {
+            var old = config.Bind<string?>("生成", oldName, null);
+            var current = config.Bind<string?>("Loading", name, null);
+            saved[name] = current.Value ?? old.Value;
+            migrated |= old.Value != null;
+            config.Remove(old.Definition);
+            config.Remove(current.Definition);
+        }
+        BatchSize = config.Bind("Loading", "Batch size", 5,
+            "Maximum contacts to create or restore per batch. Values below 1 are treated as 1. Applies to the next batch.");
+        PauseUpdates = config.Bind("Loading", "Updates to skip", 1,
+            "Updates to skip between batches. 0 or less runs every update. Decreases shorten the current wait; increases apply after the next batch. No restart required.");
+        foreach (var entry in new[] { BatchSize, PauseUpdates })
+            if (saved[entry.Definition.Key] is { } value) entry.SetSerializedValue(value);
+        if (migrated) config.Save();
     }
     internal static Action<Exception>? ReportError;
     internal static readonly ConditionalWeakTable<ContactsDialog, Loading> Pending = new();
@@ -109,12 +124,12 @@ internal static class ContactsPatches
         var enumerate = AccessTools.Method(typeof(ContactManager), nameof(ContactManager.ForeachContactData));
         var matches = code.Select((op, index) => (op, index)).Where(p => p.op.Calls(enumerate)).ToArray();
         if (matches.Length != 1)
-            throw new InvalidOperationException($"初期列挙の呼び出しが一意ではありません: {matches.Length}");
+            throw new InvalidOperationException($"Expected one initial contact enumeration call; found {matches.Length}.");
         int i = matches[0].index;
         if (i < 3 || code[i - 3].opcode != OpCodes.Ldarg_0 || code[i - 2].opcode != OpCodes.Ldftn
             || code[i - 2].operand is not MethodInfo callback || callback.IsStatic
             || callback.DeclaringType != typeof(ContactsDialog) || code[i - 1].opcode != OpCodes.Newobj)
-            throw new InvalidOperationException("初期生成のコールバック形式が変わっています。");
+            throw new InvalidOperationException("The initial contact callback has an unexpected format.");
         // 命令を差し替え、分岐先ラベルと例外ブロックは保持する。
         code[i].opcode = OpCodes.Call;
         code[i].operand = AccessTools.Method(typeof(ContactsPatches), nameof(Start));
@@ -128,7 +143,7 @@ internal static class ContactsPatches
         bool writing = __originalMethod.Name != "OnCommonUpdate";
         var matches = code.Where(op => op.opcode == (writing ? OpCodes.Stfld : OpCodes.Ldfld) && Equals(op.operand, field)).ToArray();
         if (matches.Length != 1)
-            throw new InvalidOperationException($"ソート判定が一意ではありません: {matches.Length}");
+            throw new InvalidOperationException($"Expected one sort flag access; found {matches.Length}.");
         matches[0].opcode = OpCodes.Call;
         matches[0].operand = AccessTools.Method(typeof(ContactsPatches), !writing ? nameof(UpdateLoading)
             : __originalMethod.Name == "OnActivated" ? nameof(RequestActivationSort) : nameof(RequestItemSort));
@@ -140,10 +155,10 @@ internal static class ContactsPatches
         var code = instructions.ToList();
         var target = AccessTools.PropertySetter(typeof(Slot), nameof(Slot.ActiveSelf));
         var matches = code.Select((op, i) => (op, i)).Where(p => p.op.Calls(target)).ToArray();
-        if (matches.Length != 2) throw new InvalidOperationException("検索の表示切替箇所が変わっています。");
+        if (matches.Length != 2) throw new InvalidOperationException("The search visibility updates have an unexpected format.");
         var (call, index) = matches[0];
         if (index == 0 || code[index - 1].opcode != OpCodes.Ldc_I4_1)
-            throw new InvalidOperationException("検索解除のON指定が変わっています。");
+            throw new InvalidOperationException("The search reset activation has an unexpected format.");
         // 空欄の分岐だけ、trueの代わりにdialogを渡す。検索の一致判定側は本体のまま。
         code[index - 1].opcode = OpCodes.Ldarg_0;
         call.opcode = OpCodes.Call;
@@ -179,7 +194,7 @@ internal static class ContactsPatches
     {
         if (update.Target is not ContactsDialog dialog)
         {
-            ReportError?.Invoke(new InvalidOperationException("初期生成の対象が想定外のため、本体の列挙を使用します。"));
+            ReportError?.Invoke(new InvalidOperationException("Unexpected contact loading target; using the original enumeration."));
             manager.ForeachContactData(update);
             return;
         }

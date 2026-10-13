@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Version>0.3.0</Version>
+    <Authors>markn2000</Authors>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GamePath Condition="'$(GamePath)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Resonite</GamePath>
+    <DevProfile Condition="'$(DevProfile)' == ''">$(APPDATA)\com.kesomannen.gale\resonite\profiles\Mod開発</DevProfile>
+  </PropertyGroup>
+  <!-- 導入済みDLLを参照し、ゲーム由来のファイルを出力へコピーしない。 -->
+  <ItemGroup>
+    <Reference Include="$(GamePath)\FrooxEngine.dll;$(GamePath)\Elements.Core.dll;$(GamePath)\SkyFrost.Base.dll;$(GamePath)\SkyFrost.Base.Models.dll" Private="false" />
+    <Reference Include="$(DevProfile)\BepInEx\core\BepInEx.Core.dll;$(DevProfile)\BepInEx\core\BepInEx.NET.Common.dll;$(DevProfile)\BepInEx\core\0Harmony.dll" Private="false" />
+    <Reference Include="$(DevProfile)\BepInEx\plugins\ResoniteModding-BepInExResoniteShim\BepInExResoniteShim\BepInExResoniteShim.dll" Private="false" />
+    <Reference Include="$(DevProfile)\BepInEx\plugins\ResoniteModding-BepisResoniteWrapper\BepisResoniteWrapper\BepisResoniteWrapper.dll" Private="false" />
+    <InternalsVisibleTo Include="ContactsLoading.Checks" />
+  </ItemGroup>
+</Project>

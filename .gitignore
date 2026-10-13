@@ -1,0 +1,8 @@
+**/bin/
+**/obj/
+dist/
+
+# ローカルの開発記録
+SPEC.md
+RESEARCH.md
+PLAN.md

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GamePath Condition="'$(GamePath)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Resonite</GamePath>
+    <DevProfile Condition="'$(DevProfile)' == ''">$(APPDATA)\com.kesomannen.gale\resonite\profiles\Mod開発</DevProfile>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\ContactsLoading\ContactsLoading.csproj" />
+    <Reference Include="$(GamePath)\FrooxEngine.dll;$(GamePath)\Elements.Core.dll;$(GamePath)\SkyFrost.Base.dll;$(GamePath)\SkyFrost.Base.Models.dll" Private="false" />
+    <Reference Include="$(DevProfile)\BepInEx\core\0Harmony.dll;$(DevProfile)\BepInEx\core\BepInEx.Core.dll" Private="false" />
+  </ItemGroup>
+</Project>

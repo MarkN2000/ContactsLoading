@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.0", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.1", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -33,7 +33,7 @@ public sealed class Plugin : BasePlugin
             if (!File.Exists(Config.ConfigFilePath)) Config.Save();
             ContactsPatches.ReportError = error => Log.LogError($"Contactsの分割生成を中止しました: {error}");
             ContactsPatches.Apply(HarmonyInstance);
-            Log.LogInfo("SmoothContacts: 設定件数ずつ非表示で生成し、優先分・残りの2段階で表示します。");
+            Log.LogInfo("SmoothContacts検証版: 最初からActive ONで分割生成します。最後の全体ソートは維持します。");
         }
         catch (Exception error)
         {
@@ -48,6 +48,8 @@ public sealed class Plugin : BasePlugin
 
 internal static class ContactsPatches
 {
+    // 検証版の切り替え。表示タイミングだけを変えて比較する。
+    internal static readonly bool ActiveFromStart = true;
     internal static ConfigEntry<int> BatchSize = null!;
     internal static void BindSettings(ConfigFile config) => BatchSize = config.Bind("生成", "1更新あたりの件数", 10,
         "1更新で生成する最大件数。少ないほど負荷を分散し、多いほど生成が早く完了します。次の分割生成から反映します。1以上を指定してください（0以下は1として扱います）。");
@@ -286,7 +288,7 @@ internal static class ContactsPatches
         if (!Pending.TryGetValue(dialog, out var state)) return AddItem(dialog);
         var ui = ListUI(dialog);
         var slot = ui.Root.AddSlot("Panel");
-        slot.ActiveSelf = false;
+        slot.ActiveSelf = ActiveFromStart;
         slot.OrderOffset = state.RowOrder(data.UserId);
         state.Hidden[data.UserId] = slot;
         try
@@ -305,7 +307,7 @@ internal static class ContactsPatches
 
     private static void AfterItem(ContactsDialog __instance, ContactData __0)
     {
-        if (Pending.TryGetValue(__instance, out var state) && !state.Hidden.ContainsKey(__0.UserId)
+        if (Pending.TryGetValue(__instance, out var state) && (ActiveFromStart || !state.Hidden.ContainsKey(__0.UserId))
             && Items(__instance).TryGetValue(__0.UserId, out var item))
             item.Slot.ActiveSelf = MatchesSearch(item.Username, item.AlternateNames, Search(__instance).Target.TargetString);
         // ponytail: 通常イベントの生成件数は制限しない。大量発生が実測で問題なら分割処理へ合流する。
@@ -313,14 +315,14 @@ internal static class ContactsPatches
 
     private static void AfterSearch(ContactsDialog __instance)
     {
-        if (Pending.TryGetValue(__instance, out var state))
+        if (!ActiveFromStart && Pending.TryGetValue(__instance, out var state))
             foreach (var slot in state.Hidden.Values)
                 if (!slot.IsDestroyed) slot.ActiveSelf = false;
     }
 
     private static void Publish(ContactsDialog dialog, Loading state, string id)
     {
-        if (state.Hidden.Remove(id, out var slot) && !slot.IsDestroyed
+        if (state.Hidden.Remove(id, out var slot) && !ActiveFromStart && !slot.IsDestroyed
             && Items(dialog).TryGetValue(id, out var item) && item.Slot == slot)
             slot.ActiveSelf = MatchesSearch(item.Username, item.AlternateNames, Search(dialog).Target.TargetString);
     }

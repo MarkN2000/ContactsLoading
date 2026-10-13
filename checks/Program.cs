@@ -18,6 +18,8 @@ internal static class Program
     private static readonly TextField search = Empty<TextField>();
     private static string query = "";
     private static int sorts;
+    private static int activeWrites;
+    private static int writesAtSort;
     private static ContactsPatches.Loading? observed;
 
     private static void Main(string[] args)
@@ -153,8 +155,9 @@ internal static class Program
         int setActive = create.FindIndex(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf")));
         int setOrder = create.FindIndex(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "OrderOffset")));
         int attachRect = create.FindIndex(op => op.operand is MethodInfo m && m.Name == "GetComponentOrAttach" && m.GetGenericArguments().Contains(typeof(RectTransform)));
-        Check(setActive > 0 && create[setActive - 1].opcode == OpCodes.Ldc_I4_0 && setActive < attachRect && setOrder < attachRect,
-            "RectTransform取り付け前に非表示と順序を設定");
+        Check(setActive > 0 && create[setActive - 1].opcode == OpCodes.Ldsfld
+            && Equals(create[setActive - 1].operand, AccessTools.Field(typeof(ContactsPatches), nameof(ContactsPatches.ActiveFromStart)))
+            && setActive < attachRect && setOrder < attachRect, "RectTransform取り付け前に表示モードと順序を設定");
         var finish = PatchProcessor.GetOriginalInstructions(AccessTools.Method(typeof(ContactsPatches), "Finish")).ToList();
         Check(finish.FindIndex(op => op.Calls(AccessTools.Method(typeof(Slot), "SortChildren")))
             < finish.FindIndex(op => op.Calls(AccessTools.Method(typeof(ContactsPatches), "Release"))), "最終ソートが公開より先");
@@ -236,7 +239,8 @@ internal static class Program
                 AccessTools.Field(typeof(ContactItem), "_alternateNames").SetValue(item, new SyncFieldList<string>());
                 ContactsPatches.Items(dialog)[contact.UserId] = item;
                 observed!.Hidden[contact.UserId] = slot;
-                active[slot] = false;
+                active[slot] = ContactsPatches.ActiveFromStart;
+                AccessTools.Method(typeof(ContactsPatches), "AfterItem").Invoke(null, [dialog, contact]);
             });
             observed = state;
             state.Contacts = Enumerable.Range(0, 35).Select(i => data($"row{i:D2}", OnlineStatus.Online)).ToList();
@@ -245,20 +249,27 @@ internal static class Program
             ContactsPatches.Pending.Add(dialog, state);
             ContactsPatches.SortRequested(dialog) = true;
             state.Tick();
-            Check(active.Count == 10 && !active.Values.Any(v => v) && sorts == 0, "優先分の途中は全行非表示");
+            Check(active.Count == 10 && active.Values.All(v => v == ContactsPatches.ActiveFromStart) && sorts == 0,
+                "優先分の途中も指定した表示モードで生成");
             scheduled.Dequeue()();
-            Check(active.Count == 13 && active.Values.All(v => v) && sorts == 0, "優先分完成で一括公開、ソートなし");
+            Check(active.Count == 13 && active.Values.All(v => v) && sorts == 0, "優先分完成時は表示済み、ソートなし");
             scheduled.Dequeue()();
-            Check(active.Count == 23 && active.Values.Count(v => v) == 13, "残りは非表示で追加");
+            Check(active.Count == 23 && active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 23 : 13),
+                "残りも指定した表示モードで追加");
             foreach (var slot in active.Keys.ToArray()) active[slot] = true;
             AccessTools.Method(typeof(ContactsPatches), "AfterSearch").Invoke(null, [dialog]);
-            Check(active.Values.Count(v => v) == 13, "検索でも未公開の行を表示しない");
+            Check(active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 23 : 13), "検索で一括非表示にしない");
             ContactsPatches.BeforeSelect(dialog, "row30");
-            Check(active.Values.Count(v => v) == 14, "未生成の選択先だけ先行生成して公開");
+            Check(active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 24 : 14), "未生成の選択先を先行生成");
             query = "row2";
+            foreach (var item in ContactsPatches.Items(dialog).Values)
+                active[item.Slot] = ContactsPatches.MatchesSearch(item.Username, item.AlternateNames, query);
+            AccessTools.Method(typeof(ContactsPatches), "AfterSearch").Invoke(null, [dialog]);
+            Check(active.Values.Count(v => v) == (ContactsPatches.ActiveFromStart ? 3 : 0), "途中検索は現在の表示条件に従う");
             while (scheduled.TryDequeue(out var tick)) tick();
             Check(active.Count == 35 && sorts == 1 && !ContactsPatches.Pending.TryGetValue(dialog, out _), "全件生成後に1回だけソートして解放");
-            Check(state.Hidden.Count == 0 && active.Values.Count(v => v) == 24, "残りの公開時に現在の検索条件を反映");
+            Check(state.Hidden.Count == 0 && active.Values.Count(v => v) == 10, "追加行にも現在の検索条件を反映");
+            Check(!ContactsPatches.ActiveFromStart || activeWrites == writesAtSort, "検証版は最終ソート後にActiveを書き込まない");
             Check(!ContactsPatches.SortRequested(dialog), "最終ソート直後の重複ソートを要求しない");
 
             foreach (var (count, priority) in new[] { (0, 0), (5, 5), (11, 0) })
@@ -289,14 +300,15 @@ internal static class Program
         finally { harmony.UnpatchSelf(); ContactsPatches.ReportError = null; observed = null; }
     }
 
-    private static bool SetActive(Slot __instance, bool __0) { active[__instance] = __0; return false; }
+    private static bool SetActive(Slot __instance, bool __0) { activeWrites++; active[__instance] = __0; return false; }
     private static bool GetRoot(ref Slot __result) { __result = root; return false; }
     private static bool GetSearch(ref TextField __result) { __result = search; return false; }
     private static bool GetQuery(ref string __result) { __result = query; return false; }
     private static bool Schedule(int __0, Action __1) { Check(__0 == 1, "次の更新へ予約"); scheduled.Enqueue(__1); return false; }
     private static bool Sort()
     {
-        Check(observed!.Hidden.Values.All(slot => !active[slot]), "残りの行が非表示のまま最終ソート");
+        Check(ContactsPatches.ActiveFromStart || observed!.Hidden.Values.All(slot => !active[slot]), "最終ソート時の表示状態");
+        writesAtSort = activeWrites;
         sorts++;
         return false;
     }

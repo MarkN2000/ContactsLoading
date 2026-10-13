@@ -86,13 +86,16 @@ internal static class Program
             var original = PatchProcessor.GetOriginalInstructions(method).ToList();
             int length = original.Count;
             Func<IEnumerable<CodeInstruction>, IEnumerable<CodeInstruction>> transform = name switch {
-                "OnAttach" => ContactsPatches.TranspileAttach, "UpdateContactItem" => ContactsPatches.TranspileItem,
+                "OnAttach" => ContactsPatches.TranspileAttach,
                 "SearchTextChanged" => ContactsPatches.TranspileSearch,
                 _ => code => ContactsPatches.TranspileSort(code, method) };
             var changed = transform(original).ToList();
-            Check(changed.Count == length + (name == "UpdateContactItem" ? 1 : 0), "ILの追加は必要な引数だけ");
+            Check(changed.Count == length, "ILの命令数を増やさない");
             Check(changed.Count(op => op.operand is MethodInfo m && m.DeclaringType == typeof(ContactsPatches))
-                == (name == "UpdateContactItem" ? 2 : 1), "生成・ソート・検索の必要箇所だけ差し替え");
+                == 1, "生成・ソート・検索の必要箇所だけ差し替え");
+            if (name == "UpdateContactItem")
+                Check(changed.Count(op => op.Calls(AccessTools.Method(typeof(ContactsDialog), "AddContactItem"))) == 1,
+                    "本体の行生成呼び出しを差し替えず残す");
             if (name == "SearchTextChanged")
             {
                 var setter = AccessTools.PropertySetter(typeof(Slot), "ActiveSelf");
@@ -105,11 +108,13 @@ internal static class Program
             var doubled = PatchProcessor.GetOriginalInstructions(method).ToList();
             Reject(() => transform(doubled.Concat(doubled)).ToList());
         }
-        var create = PatchProcessor.GetOriginalInstructions(AccessTools.Method(typeof(ContactsPatches), "CreateItem")).ToList();
-        int setOrder = create.FindIndex(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "OrderOffset")));
-        int attachRect = create.FindIndex(op => op.operand is MethodInfo m && m.Name == "GetComponentOrAttach" && m.GetGenericArguments().Contains(typeof(RectTransform)));
-        Check(setOrder >= 0 && setOrder < attachRect, "RectTransformより先にOrderOffsetを設定");
-        Check(!create.Any(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "ActiveSelf"))), "新規Slotの既定Active ONをそのまま使う");
+        var generate = PatchProcessor.GetOriginalInstructions(AccessTools.Method(typeof(ContactsPatches), "Generate")).ToList();
+        int update = generate.FindIndex(op => op.Calls(AccessTools.Method(typeof(Action<ContactData>), "Invoke")));
+        int setOrder = generate.FindIndex(op => op.Calls(AccessTools.PropertySetter(typeof(Slot), "OrderOffset")));
+        Check(update >= 0 && setOrder > update, "本体の生成が戻ってからOrderOffsetを設定");
+        Check(!typeof(ContactsPatches).GetMethods(BindingFlags.Static | BindingFlags.NonPublic)
+            .SelectMany(method => PatchProcessor.GetOriginalInstructions(method))
+            .Any(op => op.Calls(AccessTools.PropertySetter(typeof(UIBuilder), "ForceNext"))), "UIBuilder.ForceNextに介入しない");
         Check(!typeof(ContactsPatches).GetMethods(BindingFlags.Static | BindingFlags.NonPublic)
             .SelectMany(method => PatchProcessor.GetOriginalInstructions(method))
             .Any(op => op.operand is MethodInfo m && m.Name is "SortChildren" or "RunInUpdates"), "全体ソートと更新予約を持たない");
@@ -246,6 +251,8 @@ internal static class Program
         (state.Contacts, state.Order) = ContactsPatches.Prepare(Enumerable.Range(0, 35).Select(i => data($"row{i:D2}", OnlineStatus.Offline)).ToList(), _ => 0);
         ContactsPatches.SortRequested(dialog) = false;
         Check(!ContactsPatches.UpdateLoading(dialog) && created.Count == 10 && active.Values.All(v => v), "10件ずつ最初から表示");
+        Check(ContactsPatches.Items(dialog).All(pair => orders[pair.Value.Slot] == state.Order[pair.Key] * 100L),
+            "生成した更新内で全行へ事前順位を設定");
         Check(!ContactsPatches.SortRequested(dialog) && activeWrites == 0, "初期生成のソート要求を除き、空の検索ではActiveを書き直さない");
         visible = false;
         ContactsPatches.RequestActivationSort(dialog, true);
@@ -259,6 +266,8 @@ internal static class Program
         ContactsPatches.UpdateLoading(dialog);
         Check(created.Count == 21 && selections.SequenceEqual(new[] { "row30" }) && state.Selection == null, "再表示で選択先1件と続き10件を生成");
         Check(!active[ContactsPatches.Items(dialog)["row30"].Slot], "選択先にも途中の検索条件を適用");
+        Check(orders[ContactsPatches.Items(dialog)["row30"].Slot] == state.Order["row30"] * 100L,
+            "先行選択にも同じ生成後の順位設定を適用");
         while (ContactsPatches.Pending.TryGetValue(dialog, out _)) Check(!ContactsPatches.UpdateLoading(dialog), "完成した更新でも本体ソートを呼ばない");
         Check(created.Count == 35 && created.Distinct().Count() == 35 && active.Values.Count(v => v) == 10, "全件表示・重複なし・途中検索");
         Check(!ContactsPatches.UpdateLoading(dialog), "初期生成だけなら完成後もソート要求なし");

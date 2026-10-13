@@ -13,7 +13,7 @@ using SkyFrost.Base;
 
 namespace SmoothContacts;
 
-[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.7", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
+[ResonitePlugin("markn2000.SmoothContacts", "SmoothContacts", "0.3.8", "markn2000", "https://github.com/MarkN2000/SmoothContacts")]
 [BepInDependency(BepInExResoniteShim.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 [BepInDependency(BepisResoniteWrapper.PluginMetadata.GUID, BepInDependency.DependencyFlags.HardDependency)]
 public sealed class Plugin : BasePlugin
@@ -64,8 +64,6 @@ internal static class ContactsPatches
         AccessTools.FieldRefAccess<ContactsDialog, SyncRef<TextField>>("_searchBar");
     private static readonly AccessTools.FieldRef<ContactsDialog, UIBuilder> ListUI =
         AccessTools.FieldRefAccess<ContactsDialog, UIBuilder>("listUi");
-    private static readonly Func<ContactsDialog, ContactItem> AddItem =
-        AccessTools.MethodDelegate<Func<ContactsDialog, ContactItem>>(AccessTools.Method(typeof(ContactsDialog), "AddContactItem"));
 
     internal static void Apply(Harmony harmony)
     {
@@ -86,12 +84,12 @@ internal static class ContactsPatches
         TranspileAttach(PatchProcessor.GetOriginalInstructions(attach)).ToList();
         TranspileSort(PatchProcessor.GetOriginalInstructions(commonUpdate), commonUpdate).ToList();
         TranspileSort(PatchProcessor.GetOriginalInstructions(activated), activated).ToList();
-        TranspileItem(PatchProcessor.GetOriginalInstructions(updateItem)).ToList();
+        TranspileSort(PatchProcessor.GetOriginalInstructions(updateItem), updateItem).ToList();
         TranspileSearch(PatchProcessor.GetOriginalInstructions(search)).ToList();
         harmony.Patch(attach, transpiler: Patch(nameof(TranspileAttach)));
         harmony.Patch(commonUpdate, transpiler: Patch(nameof(TranspileSort)));
         harmony.Patch(activated, transpiler: Patch(nameof(TranspileSort)));
-        harmony.Patch(updateItem, prefix: Patch(nameof(BeforeItem)), transpiler: Patch(nameof(TranspileItem)));
+        harmony.Patch(updateItem, prefix: Patch(nameof(BeforeItem)), transpiler: Patch(nameof(TranspileSort)));
         harmony.Patch(openPage, prefix: Patch(nameof(BeforeSelect)));
         harmony.Patch(selectId, prefix: Patch(nameof(BeforeSelect)));
         harmony.Patch(search, prefix: Patch(nameof(BeforeSearch)), transpiler: Patch(nameof(TranspileSearch)));
@@ -128,24 +126,6 @@ internal static class ContactsPatches
         matches[0].operand = AccessTools.Method(typeof(ContactsPatches), !writing ? nameof(UpdateLoading)
             : __originalMethod.Name == "OnActivated" ? nameof(RequestActivationSort) : nameof(RequestItemSort));
         return code;
-    }
-
-    internal static IEnumerable<CodeInstruction> TranspileItem(IEnumerable<CodeInstruction> instructions)
-    {
-        var code = instructions.ToList();
-        var target = AccessTools.Method(typeof(ContactsDialog), "AddContactItem");
-        var matches = code.Select((op, i) => (op, i)).Where(p => p.op.Calls(target)).ToArray();
-        if (matches.Length != 1) throw new InvalidOperationException("行の生成箇所が一意ではありません。");
-        var (call, index) = matches[0];
-        var data = new CodeInstruction(OpCodes.Ldarg_1);
-        data.labels.AddRange(call.labels);
-        data.blocks.AddRange(call.blocks);
-        call.labels.Clear();
-        call.blocks.Clear();
-        call.opcode = OpCodes.Call;
-        call.operand = AccessTools.Method(typeof(ContactsPatches), nameof(CreateItem));
-        code.Insert(index, data);
-        return TranspileSort(code, AccessTools.DeclaredMethod(typeof(ContactsDialog), "UpdateContactItem"));
     }
 
     internal static IEnumerable<CodeInstruction> TranspileSearch(IEnumerable<CodeInstruction> instructions)
@@ -342,8 +322,11 @@ internal static class ContactsPatches
         try
         {
             state.Update(data);
-            if (term.Length > 0 && Items(dialog).TryGetValue(data.UserId, out var item)
-                && !MatchesSearch(item.Username, item.AlternateNames, term)) item.Slot.ActiveSelf = false;
+            if (Items(dialog).TryGetValue(data.UserId, out var item))
+            {
+                item.Slot.OrderOffset = state.RowOrder(data.UserId);
+                if (term.Length > 0 && !MatchesSearch(item.Username, item.AlternateNames, term)) item.Slot.ActiveSelf = false;
+            }
         }
         finally { state.Creating = false; }
     }
@@ -385,25 +368,6 @@ internal static class ContactsPatches
             return false;
         }
         return true;
-    }
-
-    private static ContactItem CreateItem(ContactsDialog dialog, ContactData data)
-    {
-        if (!Pending.TryGetValue(dialog, out var state)) return AddItem(dialog);
-        var ui = ListUI(dialog);
-        var slot = ui.Root.AddSlot("Panel");
-        slot.OrderOffset = state.RowOrder(data.UserId);
-        try
-        {
-            ui.ForceNext = slot.GetComponentOrAttach<RectTransform>();
-            return AddItem(dialog);
-        }
-        catch
-        {
-            ui.ForceNext = null!;
-            slot.Destroy();
-            throw;
-        }
     }
 
     internal static void BeforeSearch(ContactsDialog __instance)

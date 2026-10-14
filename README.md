@@ -8,6 +8,8 @@ A [Resonite](https://resonite.com/) mod that reduces freezing when opening Conta
 
 Adjust the batch size and update interval in Bepis Mod Settings. Default: **5 contacts per batch, with 1 update skipped between batches**.
 
+May conflict with other mods that modify the Contacts list.
+
 ## Installation
 
 1. Install [BepisLoader](https://thunderstore.io/c/resonite/p/ResoniteModding/BepisLoader/).

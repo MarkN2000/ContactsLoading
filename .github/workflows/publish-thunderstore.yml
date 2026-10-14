@@ -1,0 +1,99 @@
+name: Publish to Thunderstore
+
+# Add the team's Service Account token as the THUNDERSTORE_TOKEN repository secret.
+# Attach the ZIP before publishing the release. Use a new version for each upload.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag (vX.Y.Z)
+        required: true
+        type: string
+      dry_run:
+        description: Validate without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: thunderstore-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+    steps:
+      - name: Download the release package
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          test "$(gh release view --repo "$GH_REPO" --json isDraft,isPrerelease --jq '.isDraft or .isPrerelease' -- "$RELEASE_TAG")" = false
+          gh release download --repo "$GH_REPO" --pattern 'SmoothContacts-*.zip' --dir package -- "$RELEASE_TAG"
+
+      - name: Validate the package
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import zipfile
+
+          packages = list(pathlib.Path("package").glob("*.zip"))
+          if len(packages) != 1:
+              raise SystemExit("Attach exactly one SmoothContacts ZIP to the release.")
+          with zipfile.ZipFile(packages[0]) as archive:
+              expected = {"manifest.json", "README.md", "LICENSE", "icon.png", "plugins/SmoothContacts.dll"}
+              if len(archive.namelist()) != len(expected) or set(archive.namelist()) != expected:
+                  raise SystemExit("Unexpected package contents.")
+              if archive.testzip() is not None:
+                  raise SystemExit("The package ZIP is corrupt.")
+              manifest = json.loads(archive.read("manifest.json"))
+          version = manifest.get("version_number", "")
+          if manifest.get("name") != "SmoothContacts" or not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", version):
+              raise SystemExit("Invalid package name or version.")
+          if os.environ["RELEASE_TAG"] != f"v{version}":
+              raise SystemExit("The release tag does not match the package version.")
+          packages[0].rename("package.zip")
+          print(f"Validated SmoothContacts {version}.")
+          PY
+
+      - name: Download the official Thunderstore CLI
+        run: |
+          curl --fail --location --retry 3 --output "$RUNNER_TEMP/tcli.tar.gz" \
+            https://github.com/thunderstore-io/thunderstore-cli/releases/download/0.2.4/tcli-0.2.4-linux-x64.tar.gz
+          echo "bd7df48875e0c819a23a3bfaccf493c8cdf45288d9445558157a51126d0eab32  $RUNNER_TEMP/tcli.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/tcli.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/tcli-0.2.4-linux-x64/tcli" publish --help
+
+      - name: Publish the package
+        if: ${{ github.event_name == 'release' || !inputs.dry_run }}
+        env:
+          TCLI_AUTH_TOKEN: ${{ secrets.THUNDERSTORE_TOKEN }}
+        run: |
+          if [ -z "$TCLI_AUTH_TOKEN" ]; then
+            echo "::error::Set the THUNDERSTORE_TOKEN repository secret first."
+            exit 1
+          fi
+          cat > "$RUNNER_TEMP/thunderstore.toml" <<'TOML'
+          [package]
+          namespace = "markn2000"
+          name = "SmoothContacts"
+          [publish]
+          repository = "https://thunderstore.io"
+          communities = ["resonite"]
+          [publish.categories]
+          resonite = ["mods", "optimization", "ai-generated"]
+          TOML
+          "$RUNNER_TEMP/tcli-0.2.4-linux-x64/tcli" publish \
+            --config-path "$RUNNER_TEMP/thunderstore.toml" \
+            --file package.zip

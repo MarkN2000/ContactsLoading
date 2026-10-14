@@ -73,7 +73,6 @@ jobs:
             https://github.com/thunderstore-io/thunderstore-cli/releases/download/0.2.4/tcli-0.2.4-linux-x64.tar.gz
           echo "bd7df48875e0c819a23a3bfaccf493c8cdf45288d9445558157a51126d0eab32  $RUNNER_TEMP/tcli.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/tcli.tar.gz" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/tcli-0.2.4-linux-x64/tcli" publish --help
 
       - name: Publish the package
         if: ${{ github.event_name == 'release' || !inputs.dry_run }}
